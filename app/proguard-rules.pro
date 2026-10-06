@@ -1,0 +1,2 @@
+-keep class com.mediflow.app.** { *; }
+-keepattributes *Annotation*
