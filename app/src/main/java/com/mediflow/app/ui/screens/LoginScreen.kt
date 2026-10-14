@@ -29,7 +29,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.BuildConfig
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.auth.AuthOutcome
+import com.mediflow.app.data.model.UserRole
 import com.mediflow.app.ui.theme.*
+import kotlinx.coroutines.launch
 
 /**
  * Screen 2 — Login / Sign Up (Tabbed Toggle)
@@ -55,7 +60,8 @@ fun LoginScreen(
     onLoginSuccess: () -> Unit,
     onPharmacistLogin: () -> Unit,
     onAdminLogin: () -> Unit,
-    onForgotPassword: () -> Unit
+    onForgotPassword: () -> Unit,
+    onOpenSeeder: () -> Unit = {}
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -121,6 +127,7 @@ fun LoginScreen(
                         onPharmacistLogin = onPharmacistLogin,
                         onAdminLogin = onAdminLogin,
                         onForgotPassword = onForgotPassword,
+                        onOpenSeeder = onOpenSeeder,
                         onSwitchToSignUp = { selectedTab = 1 }
                     )
                 } else {
@@ -321,25 +328,41 @@ private enum class LoginRole(
     val label: String,
     val icon: ImageVector,
     val signInLabel: String,
-    val signInDescription: String
+    val signInDescription: String,
+    val userRole: UserRole,
+    val identifierLabel: String,
+    val identifierPlaceholder: String,
+    val identifierDescription: String
 ) {
     PATIENT(
         label = "Patient",
         icon = Icons.Rounded.Person,
         signInLabel = "Sign In Securely",
-        signInDescription = "Sign in securely button"
+        signInDescription = "Sign in securely button",
+        userRole = UserRole.PATIENT,
+        identifierLabel = "Mobile / NIC Number",
+        identifierPlaceholder = "07X XXXX XXX or 1990123456V",
+        identifierDescription = "Mobile or NIC number input field"
     ),
     PHARMACIST(
         label = "Pharmacist",
         icon = Icons.Rounded.LocalPharmacy,
         signInLabel = "Sign In to Pharmacy",
-        signInDescription = "Sign in to the pharmacy stock screen"
+        signInDescription = "Sign in to the pharmacy stock screen",
+        userRole = UserRole.PHARMACIST,
+        identifierLabel = "Pharmacist ID",
+        identifierPlaceholder = "0100",
+        identifierDescription = "Pharmacy identifier input field"
     ),
     ADMIN(
         label = "Admin",
         icon = Icons.Rounded.AdminPanelSettings,
         signInLabel = "Sign In to Console",
-        signInDescription = "Sign in to the system admin console"
+        signInDescription = "Sign in to the system admin console",
+        userRole = UserRole.ADMIN,
+        identifierLabel = "Admin Email",
+        identifierPlaceholder = "you@example.com",
+        identifierDescription = "Admin email input field"
     )
 }
 
@@ -349,9 +372,11 @@ private fun LoginForm(
     onPharmacistLogin: () -> Unit,
     onAdminLogin: () -> Unit,
     onForgotPassword: () -> Unit,
+    onOpenSeeder: () -> Unit,
     onSwitchToSignUp: () -> Unit
 ) {
     val focusManager = LocalFocusManager.current
+    val scope = rememberCoroutineScope()
 
     var role by remember { mutableStateOf(LoginRole.PATIENT) }
     var mobileNic by remember { mutableStateOf("") }
@@ -392,19 +417,19 @@ private fun LoginForm(
                 mobileNic = it
                 mobileError = null
             },
-            label = "Mobile / NIC Number",
-            placeholder = "07X XXXX XXX or 200XXXXXXXXX",
+            label = role.identifierLabel,
+            placeholder = role.identifierPlaceholder,
             leadingIcon = Icons.Rounded.Phone,
             leadingIconDesc = "Phone icon",
             keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Phone,
+                keyboardType = if (role == LoginRole.ADMIN) KeyboardType.Email else KeyboardType.Phone,
                 imeAction = ImeAction.Next
             ),
             keyboardActions = KeyboardActions(
                 onNext = { focusManager.moveFocus(FocusDirection.Down) }
             ),
             errorMessage = mobileError,
-            contentDescription = "Mobile or NIC number input field"
+            contentDescription = role.identifierDescription
         )
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -476,56 +501,46 @@ private fun LoginForm(
                 }
                 if (!hasError) {
                     isLoading = true
-                    // Simulate auth — replace with real auth logic. The role is a
-                    // UI-only branch until the backend can issue role-scoped tokens.
-                    when (role) {
-                        LoginRole.PATIENT -> onLoginSuccess()
-                        LoginRole.PHARMACIST -> onPharmacistLogin()
-                        LoginRole.ADMIN -> onAdminLogin()
+                    scope.launch {
+                        when (val outcome = AppGraph.auth.signIn(role.userRole, mobileNic, password)) {
+                            is AuthOutcome.SignedIn -> {
+                                AppGraph.rememberProfile(outcome.profile)
+                                // Routing follows the stored role, not the selected tab.
+                                when (outcome.profile.role) {
+                                    UserRole.PATIENT -> onLoginSuccess()
+                                    UserRole.PHARMACIST -> onPharmacistLogin()
+                                    UserRole.ADMIN -> onAdminLogin()
+                                }
+                            }
+                            is AuthOutcome.NeedsAccount -> {
+                                isLoading = false
+                                mobileError = outcome.message
+                            }
+                            is AuthOutcome.Failed -> {
+                                isLoading = false
+                                mobileError = outcome.message
+                            }
+                        }
                     }
                 }
             }
         )
 
+        if (BuildConfig.DEBUG) {
+            TextButton(
+                onClick = onOpenSeeder,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics { contentDescription = "Open the demo Firestore seeder" }
+            ) {
+                Text(
+                    text = "Debug: seed demo data",
+                    style = MaterialTheme.typography.bodySmall.copy(color = SlateMedium)
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
-
-        // ── Divider with OR ───────────────────────────────────────────────
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            HorizontalDivider(modifier = Modifier.weight(1f), color = BorderColor)
-            Text(
-                text = "  or continue with  ",
-                style = MaterialTheme.typography.bodySmall.copy(color = SlateLight)
-            )
-            HorizontalDivider(modifier = Modifier.weight(1f), color = BorderColor)
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // ── Social Login Placeholders ─────────────────────────────────────
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            SocialLoginButton(
-                modifier = Modifier.weight(1f),
-                label = "Google",
-                icon = Icons.Rounded.Language,
-                contentDescription = "Continue with Google",
-                onClick = { /* TODO: Google sign-in */ }
-            )
-            SocialLoginButton(
-                modifier = Modifier.weight(1f),
-                label = "Facebook",
-                icon = Icons.Rounded.Groups,
-                contentDescription = "Continue with Facebook",
-                onClick = { /* TODO: Facebook sign-in */ }
-            )
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
 
         // ── Switch to Sign Up ─────────────────────────────────────────────
         Row(
@@ -557,10 +572,10 @@ private fun SignUpForm(
     onSwitchToLogin: () -> Unit
 ) {
     val focusManager = LocalFocusManager.current
+    val scope = rememberCoroutineScope()
 
     var fullName      by remember { mutableStateOf("") }
     var mobileNic     by remember { mutableStateOf("") }
-    var email         by remember { mutableStateOf("") }
     var password      by remember { mutableStateOf("") }
     var confirmPwd    by remember { mutableStateOf("") }
     var passwordVisible  by remember { mutableStateOf(false) }
@@ -570,7 +585,6 @@ private fun SignUpForm(
 
     var nameError     by remember { mutableStateOf<String?>(null) }
     var mobileError   by remember { mutableStateOf<String?>(null) }
-    var emailError    by remember { mutableStateOf<String?>(null) }
     var passwordError by remember { mutableStateOf<String?>(null) }
     var confirmError  by remember { mutableStateOf<String?>(null) }
     var termsError    by remember { mutableStateOf<String?>(null) }
@@ -629,21 +643,11 @@ private fun SignUpForm(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Email (optional)
-        MediFlowTextField(
-            value = email,
-            onValueChange = { email = it; emailError = null },
-            label = "Email Address (Optional)",
-            placeholder = "you@example.com",
-            leadingIcon = Icons.Rounded.Email,
-            leadingIconDesc = "Email icon",
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Email,
-                imeAction = ImeAction.Next
-            ),
-            keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
-            errorMessage = emailError,
-            contentDescription = "Email address input"
+        // No email is collected: the account is addressed by the mobile or NIC
+        // above, mapped onto a synthetic address that only Firebase Auth sees.
+        Text(
+            text = "You sign in with this mobile or NIC number — no email needed.",
+            style = MaterialTheme.typography.bodySmall.copy(color = SlateMedium)
         )
 
         Spacer(modifier = Modifier.height(14.dp))
@@ -741,15 +745,32 @@ private fun SignUpForm(
                 var hasError = false
                 if (fullName.isBlank()) { nameError = "Full name is required"; hasError = true }
                 if (mobileNic.isBlank()) { mobileError = "Mobile or NIC is required"; hasError = true }
-                if (email.isNotBlank() && !android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
-                    emailError = "Enter a valid email address"; hasError = true
-                }
                 if (password.length < 8) { passwordError = "Password must be at least 8 characters"; hasError = true }
                 if (confirmPwd != password) { confirmError = "Passwords do not match"; hasError = true }
                 if (!termsAccepted) { termsError = "You must accept the Terms & Conditions"; hasError = true }
                 if (!hasError) {
                     isLoading = true
-                    onSignUpSuccess()
+                    scope.launch {
+                        when (val outcome = AppGraph.auth.signUp(
+                            role = UserRole.PATIENT,
+                            identifier = mobileNic,
+                            password = password,
+                            name = fullName
+                        )) {
+                            is AuthOutcome.SignedIn -> {
+                                AppGraph.rememberProfile(outcome.profile)
+                                onSignUpSuccess()
+                            }
+                            is AuthOutcome.Failed -> {
+                                isLoading = false
+                                mobileError = outcome.message
+                            }
+                            is AuthOutcome.NeedsAccount -> {
+                                isLoading = false
+                                mobileError = outcome.message
+                            }
+                        }
+                    }
                 }
             }
         )
@@ -946,46 +967,6 @@ fun MediFlowPrimaryButton(
                 )
             }
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Reusable: Social Login Button
-// ─────────────────────────────────────────────────────────────────────────────
-@Composable
-private fun SocialLoginButton(
-    modifier: Modifier = Modifier,
-    label: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    contentDescription: String,
-    onClick: () -> Unit
-) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier
-            .height(48.dp)
-            .semantics { this.contentDescription = contentDescription },
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, BorderColor),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = SurfaceWhite,
-            contentColor = DarkSlate
-        )
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = SlateMedium,
-            modifier = Modifier.size(18.dp)
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium.copy(
-                fontWeight = FontWeight.Medium,
-                color = DarkSlate
-            )
-        )
     }
 }
 

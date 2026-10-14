@@ -1,5 +1,7 @@
 package com.mediflow.app.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -15,28 +17,38 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.CartLine
+import com.mediflow.app.data.CartStore
+import com.mediflow.app.data.model.NotificationType
+import com.mediflow.app.data.model.PharmacyInfo
+import com.mediflow.app.data.model.ReservationItem
+import com.mediflow.app.data.model.StockItem
 import com.mediflow.app.ui.theme.*
 import kotlinx.coroutines.launch
 
 /**
  * Screen 9 — Stock Results (Variant B / Figma 5)
  *
- * The answer to "does anybody near me actually have this?". Results are grouped
- * by how completely each pharmacy covers the reservation, and that match state
- * is the loudest thing on the card — a patient decides where to travel, so a
- * partial fill has to be unmistakable before they commit to 3.5 km.
+ * The answer to "does anybody near me actually have this?". Every row comes from
+ * Firestore: the approved branches in the area the patient picked, and each branch's
+ * stock row for every medicine in the cart. Coverage is computed against the real
+ * shelf count, so "Partial — 1 of 2 items" means one line genuinely cannot be filled
+ * here. Results are grouped by that coverage and it is the loudest thing on the card,
+ * because a patient decides where to travel.
+ *
+ * Ratings and distance stay fixed: no rating feed and no patient location exist yet.
+ * Everything else on the card is read from the branch document.
  *
  * Sort and filter are one shared piece of state, reachable from the inline bar
  * and the top-bar sheet, so the two controls can never disagree.
- *
- * [samplePharmacies] is fixed demo data; the radius, per-branch stock and
- * reservation hold are backend concerns.
  *
  * WCAG 2.1 AA: badges pair colour with an icon, emoji and words, so they never
  * rely on colour alone; every control is a 40dp+ target with a contrast-checked
@@ -45,9 +57,12 @@ import kotlinx.coroutines.launch
 
 private enum class Match { FULL, PARTIAL, NONE }
 
-private data class Pharmacy(
+/** One branch's ability to fill the current cart. */
+private data class StockResultPharmacy(
+    val pharmacyId: String,
     val name: String,
     val address: String,
+    val areaLabel: String,
     val distanceKm: Double,
     val rating: Float,
     val reviews: Int,
@@ -55,55 +70,89 @@ private data class Pharmacy(
     val filled: Int,
     val requested: Int,
     val phone: String,
+    val latitude: Double,
+    val longitude: Double,
     val openNow: Boolean,
     val roundTheClock: Boolean,
-    val delivers: Boolean
-)
+    val delivers: Boolean,
+    val items: List<ReservationItem>,
+    val unfilledLabels: List<String>
+) {
+    val totalLKR: Double get() = items.sumOf { it.lineTotalLKR }
+}
 
-private val samplePharmacies = listOf(
-    Pharmacy(
-        name = "City Pharmacy Negombo",
-        address = "No. 45, Main Street, Negombo",
-        distanceKm = 1.2,
-        rating = 4.6f,
-        reviews = 218,
-        match = Match.FULL,
-        filled = 2,
-        requested = 2,
-        phone = "+94 31 222 1145",
-        openNow = true,
-        roundTheClock = false,
-        delivers = true
-    ),
-    Pharmacy(
-        name = "HealthMart Wattala",
-        address = "No. 112, Main Road, Wattala",
-        distanceKm = 3.5,
-        rating = 4.3f,
-        reviews = 96,
-        match = Match.PARTIAL,
-        filled = 1,
-        requested = 2,
-        phone = "+94 11 259 4477",
-        openNow = true,
-        roundTheClock = false,
-        delivers = false
-    ),
-    Pharmacy(
-        name = "Sevana Pharmacy Kimseriya",
-        address = "No. 8B, Kiulapitiya Road, Negombo",
-        distanceKm = 4.1,
-        rating = 4.8f,
-        reviews = 341,
-        match = Match.NONE,
-        filled = 0,
-        requested = 2,
-        phone = "+94 31 228 7063",
-        openNow = false,
-        roundTheClock = true,
-        delivers = true
+/** No rating feed and no device location yet, so these are set decoration (per spec). */
+private const val DEMO_DISTANCE_KM = 1.2
+private const val DEMO_RATING = 4.6f
+private const val DEMO_REVIEWS = 218
+
+private fun toResult(
+    pharmacy: PharmacyInfo,
+    cart: List<CartLine>,
+    stockFor: (String) -> StockItem?
+): StockResultPharmacy {
+    val fillable = cart.mapNotNull { line ->
+        val stock = stockFor(line.medicineId) ?: return@mapNotNull null
+        if (stock.stockQuantity < line.quantity) null
+        else ReservationItem(
+            medicineId = line.medicineId,
+            name = line.name,
+            strength = line.strength,
+            form = line.form,
+            quantity = line.quantity,
+            unitPriceLKR = stock.unitPriceLKR
+        )
+    }
+    val unfilled = cart.mapNotNull { line ->
+        if (fillable.any { it.medicineId == line.medicineId }) null else line.title
+    }
+    return StockResultPharmacy(
+        pharmacyId = pharmacy.pharmacyId,
+        name = pharmacy.name,
+        address = pharmacy.address,
+        areaLabel = pharmacy.areaLabel,
+        distanceKm = DEMO_DISTANCE_KM,
+        rating = DEMO_RATING,
+        reviews = DEMO_REVIEWS,
+        match = when {
+            fillable.isEmpty() -> Match.NONE
+            unfilled.isEmpty() -> Match.FULL
+            else -> Match.PARTIAL
+        },
+        filled = fillable.size,
+        requested = cart.size,
+        phone = pharmacy.phone,
+        latitude = pharmacy.latitude,
+        longitude = pharmacy.longitude,
+        openNow = isOpenNow(pharmacy.openingHours),
+        roundTheClock = pharmacy.openingHours.contains("24"),
+        delivers = pharmacy.deliveryFeeLKR > 0,
+        items = fillable,
+        unfilledLabels = unfilled
     )
-)
+}
+
+/** "08:00-21:00" and "08:00 AM - 08:00 PM" are both in the catalogue. */
+private fun isOpenNow(openingHours: String): Boolean {
+    if (openingHours.isBlank()) return false
+    if (openingHours.contains("24")) return true
+    val times = TIME_IN_RANGE.findAll(openingHours).map { match ->
+        val hour = match.groupValues[1].toInt()
+        val minute = match.groupValues[2].toInt()
+        val meridiem = match.groupValues[3].uppercase().ifBlank { null }
+        when {
+            meridiem == "PM" && hour < 12 -> hour + 12
+            meridiem == "AM" && hour == 12 -> 0
+            else -> hour
+        } * 60 + minute
+    }.toList()
+    if (times.size < 2) return false
+    val now = java.time.LocalTime.now()
+    val minutes = now.hour * 60 + now.minute
+    return minutes in times.first() until times.last()
+}
+
+private val TIME_IN_RANGE = Regex("""(\d{1,2}):(\d{2})\s*(AM|PM)?""")
 
 private enum class SortBy(val label: String) {
     DISTANCE("Distance"),
@@ -127,15 +176,45 @@ fun StockResultsScreen(
     onBack: () -> Unit,
     onShowQr: (reference: String, medicineLabel: String, pharmacyName: String) -> Unit
 ) {
-    var sortBy by remember { mutableStateOf(SortBy.DISTANCE) }
+    val context = LocalContext.current
+    val cart = CartStore.lines
+    var sortBy by remember { mutableStateOf(SortBy.AVAILABILITY) }
     var filters by remember { mutableStateOf(setOf<Filter>()) }
     var showSheet by remember { mutableStateOf(false) }
-    var confirming by remember { mutableStateOf<Pharmacy?>(null) }
-    val reserved = remember { mutableStateMapOf<String, Unit>() }
+    var confirming by remember { mutableStateOf<StockResultPharmacy?>(null) }
+    val reserved = remember { mutableStateMapOf<String, String>() }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    val matching = samplePharmacies.filter { pharmacy ->
+    var candidates by remember { mutableStateOf<List<StockResultPharmacy>?>(null) }
+    var loadMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(area, cart) {
+        // Once a hold is placed here the list keeps showing it, even though the cart
+        // it was built from has been cleared.
+        if (reserved.isNotEmpty()) return@LaunchedEffect
+        if (cart.isEmpty()) {
+            candidates = emptyList()
+        } else {
+            loadMessage = "Checking stock…"
+            val outcome = runCatching {
+                val offers = AppGraph.pharmacies.offersFor(cart.map { it.medicineId }, area)
+                val byPharmacy = offers.values.flatten().groupBy({ it.pharmacy }, { it })
+                byPharmacy.map { (pharmacy, stockOffers) ->
+                    val held = stockOffers.mapNotNull { it.stock }
+                    toResult(pharmacy, cart) { medicineId ->
+                        held.firstOrNull { it.medicineId == medicineId }
+                    }
+                }
+            }
+            candidates = outcome.getOrNull().orEmpty()
+            loadMessage = if (outcome.isFailure) {
+                "Couldn't reach the stock list. Pull back and try again."
+            } else null
+        }
+    }
+
+    val matching = candidates.orEmpty().filter { pharmacy ->
         filters.all { filter ->
             when (filter) {
                 Filter.OPEN_NOW -> pharmacy.openNow
@@ -167,7 +246,7 @@ fun StockResultsScreen(
                 .padding(innerPadding)
         ) {
             SummaryCard(
-                medicineLabel = medicineLabel.ifBlank { "Reserved medicines" },
+                medicineLabel = medicineLabel.ifBlank { cart.firstOrNull()?.title ?: "Reserved medicines" },
                 area = area,
                 found = visible.size
             )
@@ -180,8 +259,27 @@ fun StockResultsScreen(
                 }
             )
 
-            if (visible.isEmpty()) {
-                NoResultsCard(onClear = { filters = emptySet() })
+            loadMessage?.let { message ->
+                Text(
+                    text = message,
+                    fontSize = 13.5.sp,
+                    color = SlateMedium,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+                )
+            }
+
+            if (candidates == null) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 40.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = ForestEmerald, modifier = Modifier.size(30.dp))
+                }
+            } else if (visible.isEmpty()) {
+                NoResultsCard(
+                    medicineCount = cart.size,
+                    onClear = { filters = emptySet() }
+                )
             } else {
                 LazyColumn(
                     // weight(1f), not fillMaxSize(): inside a Column the latter
@@ -193,21 +291,39 @@ fun StockResultsScreen(
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    items(visible, key = { it.name }) { pharmacy ->
+                    items(visible, key = { it.pharmacyId }) { pharmacy ->
+                        val reference = reserved[pharmacy.pharmacyId]
                         PharmacyCard(
                             pharmacy = pharmacy,
-                            held = pharmacy.name in reserved,
+                            heldReference = reference,
                             onReserve = { confirming = pharmacy },
                             onCall = {
-                                // TODO(backend): ACTION_DIAL with pharmacy.phone
-                                scope.launch {
-                                    snackbarHostState.showSnackbar(CALLBACK_PLACEHOLDER)
+                                if (!openPhone(context, pharmacy.phone)) {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("No phone number for this branch yet.")
+                                    }
                                 }
                             },
                             onDirections = {
-                                // TODO(backend): Google Maps / PickMe deep link
-                                scope.launch {
-                                    snackbarHostState.showSnackbar(CALLBACK_PLACEHOLDER)
+                                if (!openDirections(context, pharmacy)) {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("No map location for this branch yet.")
+                                    }
+                                }
+                            },
+                            onRestockAlert = {
+                                val uid = AppGraph.currentProfile?.uid
+                                if (uid != null) {
+                                    scope.launch {
+                                        AppGraph.notifications.alertPharmacy(
+                                            pharmacyId = pharmacy.pharmacyId,
+                                            patientUid = uid,
+                                            type = NotificationType.STOCK_SHORTAGE,
+                                            title = "Patient wants ${cart.firstOrNull()?.title ?: "restock"}",
+                                            body = "Ask ${pharmacy.name} to message you when these are back: " +
+                                                cart.joinToString { it.title }
+                                        )
+                                    }
                                 }
                             }
                         )
@@ -231,27 +347,63 @@ fun StockResultsScreen(
     }
 
     confirming?.let { pharmacy ->
+        val profile = AppGraph.currentProfile
         ReservationConfirmationSheet(
-            medicineLabel = medicineLabel.ifBlank { "Paracetamol 500mg" },
-            quantity = pharmacy.requested,
+            lines = pharmacy.items,
             pharmacyName = pharmacy.name,
+            unfilledLabels = pharmacy.unfilledLabels,
+            patientName = profile?.name.orEmpty(),
+            hasSlip = CartStore.slipStoragePath != null,
             onDismiss = { confirming = null },
-            onConfirmed = { name ->
-                reserved[name] = Unit
-                scope.launch {
-                    snackbarHostState.showSnackbar("Reservation confirmed at $name")
-                }
-            },
             onOpenQr = { reference, label, name ->
                 confirming = null
                 onShowQr(reference, label, name)
+            },
+            onConfirm = {
+                if (profile == null) {
+                    Result.failure(Exception("Sign in again to place the reservation."))
+                } else {
+                    AppGraph.reservations.reserve(
+                        patientUid = profile.uid,
+                        patientName = profile.name,
+                        pharmacyId = pharmacy.pharmacyId,
+                        pharmacyName = pharmacy.name,
+                        areaLabel = pharmacy.areaLabel,
+                        items = pharmacy.items,
+                        prescriptionStoragePath = CartStore.slipStoragePath
+                    ).onSuccess { reservation ->
+                        reserved[pharmacy.pharmacyId] = reservation.reference
+                        AppGraph.notifications.tellPatient(
+                            patientUid = profile.uid,
+                            type = NotificationType.RESERVATION_CONFIRMED,
+                            title = "Held at ${pharmacy.name}",
+                            body = "Show reference ${reservation.reference} at the counter within 24 hours.",
+                            reservationId = reservation.reservationId
+                        )
+                        CartStore.clear()
+                    }
+                }
             }
         )
     }
 }
 
-private const val CALLBACK_PLACEHOLDER =
-    "Calls and directions open once the backend is wired."
+private fun openPhone(context: android.content.Context, phone: String): Boolean {
+    val digits = phone.filter { it.isDigit() || it == '+' }
+    if (digits.isBlank()) return false
+    val intent = Intent(android.content.Intent.ACTION_DIAL, Uri.parse("tel:$digits"))
+    return runCatching { context.startActivity(intent) }.isSuccess
+}
+
+private fun openDirections(context: android.content.Context, pharmacy: StockResultPharmacy): Boolean {
+    if (pharmacy.latitude == 0.0 && pharmacy.longitude == 0.0) return false
+    val label = Uri.encode("${pharmacy.name}, ${pharmacy.address}")
+    val intent = Intent(
+        android.content.Intent.ACTION_VIEW,
+        Uri.parse("geo:0,0?q=${pharmacy.latitude},${pharmacy.longitude}($label)")
+    )
+    return runCatching { context.startActivity(intent) }.isSuccess
+}
 
 private fun Match.rank(): Int = when (this) {
     Match.FULL -> 0
@@ -472,7 +624,7 @@ private fun ResultFilterChip(label: String, selected: Boolean, onClick: () -> Un
 }
 
 @Composable
-private fun NoResultsCard(onClear: () -> Unit) {
+private fun NoResultsCard(medicineCount: Int, onClear: () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
         modifier = Modifier
@@ -487,14 +639,20 @@ private fun NoResultsCard(onClear: () -> Unit) {
             horizontalAlignment = Alignment.Start
         ) {
             Text(
-                text = "No pharmacy here matches those filters.",
+                text = when {
+                    medicineCount == 0 -> "Your reservation is empty."
+                    else -> "No approved pharmacy in this area matches those filters."
+                },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
                 color = DarkSlate
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "Widen the search — availability changes through the day.",
+                text = when {
+                    medicineCount == 0 -> "Go back and search for a medicine first."
+                    else -> "Widen the search — availability changes through the day."
+                },
                 fontSize = 13.5.sp,
                 color = SlateMedium
             )
@@ -520,13 +678,15 @@ private fun NoResultsCard(onClear: () -> Unit) {
 
 @Composable
 private fun PharmacyCard(
-    pharmacy: Pharmacy,
-    held: Boolean,
+    pharmacy: StockResultPharmacy,
+    heldReference: String?,
     onReserve: () -> Unit,
     onCall: () -> Unit,
-    onDirections: () -> Unit
+    onDirections: () -> Unit,
+    onRestockAlert: () -> Unit
 ) {
-    var notified by remember(pharmacy.name) { mutableStateOf(false) }
+    var notified by remember(pharmacy.pharmacyId) { mutableStateOf(false) }
+    val held = heldReference != null
     val shape = RoundedCornerShape(18.dp)
     Surface(
         modifier = Modifier
@@ -625,7 +785,7 @@ private fun PharmacyCard(
 
             Spacer(Modifier.height(14.dp))
             if (pharmacy.match == Match.NONE) {
-                OutOfStockActions(notified = notified, onNotify = { notified = true })
+                OutOfStockActions(notified = notified, onNotify = { notified = true; onRestockAlert() })
             } else {
                 ActionRow(
                     held = held,
@@ -641,7 +801,7 @@ private fun PharmacyCard(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .semantics { contentDescription = "Reservation confirmed, expires in 24 hours" },
+                        .semantics { contentDescription = "Held, reference $heldReference" },
                     shape = holdShape,
                     color = MintGreen.copy(alpha = 0.10f),
                     border = BorderStroke(1.dp, MintGreen.copy(alpha = 0.4f))
@@ -658,7 +818,7 @@ private fun PharmacyCard(
                         )
                         Spacer(Modifier.width(9.dp))
                         Text(
-                            text = "Confirmed · expires in 24 hours · show the QR at the counter",
+                            text = "Held · $heldReference · show it at the counter within 24 hours",
                             fontSize = 12.5.sp,
                             fontWeight = FontWeight.Medium,
                             color = DarkSlate
@@ -670,14 +830,14 @@ private fun PharmacyCard(
     }
 }
 
-private fun serviceTags(pharmacy: Pharmacy): List<String> = buildList {
+private fun serviceTags(pharmacy: StockResultPharmacy): List<String> = buildList {
     if (pharmacy.roundTheClock) add("Open 24 hours")
     if (pharmacy.delivers) add("Delivery")
     if (pharmacy.openNow && !pharmacy.roundTheClock) add("Open now")
 }
 
 @Composable
-private fun MatchBadge(pharmacy: Pharmacy) {
+private fun MatchBadge(pharmacy: StockResultPharmacy) {
     val (label, background, content) = when (pharmacy.match) {
         Match.FULL -> Triple(
             "✅ Full Match — In Stock",

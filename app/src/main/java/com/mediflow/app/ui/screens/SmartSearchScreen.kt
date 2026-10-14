@@ -26,8 +26,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.CartStore
+import com.mediflow.app.data.model.Medicine
 import com.mediflow.app.ui.components.PrescriptionThumbnail
 import com.mediflow.app.ui.theme.*
+import kotlinx.coroutines.delay
 
 /**
  * Screen 6 — Smart Medicine Search (Variant B / Figma 3B)
@@ -40,77 +44,18 @@ import com.mediflow.app.ui.theme.*
  *  • Slip       — attached prescription thumbnail, only when one was captured
  *  • Bottom     — NMRA hint + "Proceed to Verification"
  *
- * [sampleMedicines] is UI-phase scaffolding standing in for the NMRA essential
- * medicines list the search endpoint will return later.
+ * Autocomplete matches and the strength/form variant picker are read live from
+ * the NMRA medicine catalogue through [AppGraph.medicines]; the chosen variant is
+ * added to [CartStore] before the screen advances.
  *
  * WCAG 2.1 AA: 48dp+ touch targets, semantic labels on every control,
  * placeholder rendered in DarkSlate rather than the usual low-contrast grey.
  */
 
-private data class Medicine(
-    val name: String,
-    val strength: String,
-    val form: String,
-    val brand: String? = null,
-    val variants: List<String>
-) {
-    val title: String get() = if (brand == null) "$name $strength" else "$name $strength ($brand)"
-    val caption: String get() = "$form · $strength"
-
-    /** Used once a variant is chosen, where the variant itself carries the strength. */
-    val heading: String get() = if (brand == null) name else "$name ($brand)"
-
-    fun matches(query: String): Boolean {
-        val needle = query.trim().lowercase()
-        return needle.isEmpty() ||
-            name.lowercase().contains(needle) ||
-            brand?.lowercase()?.contains(needle) == true ||
-            strength.lowercase().contains(needle) ||
-            form.lowercase().contains(needle)
-    }
-
-    /**
-     * Prefix hits first: "amo" must surface Amoxicillin, not every medicine
-     * that happens to contain those letters ("parac`amo`lol").
-     */
-    fun relevance(query: String): Int {
-        val needle = query.trim().lowercase()
-        return when {
-            name.lowercase().startsWith(needle) -> 0
-            brand?.lowercase()?.startsWith(needle) == true -> 1
-            else -> 2
-        }
-    }
-}
-
-private val sampleMedicines = listOf(
-    Medicine("Paracetamol", "500mg", "Tablet", brand = "Panadol",
-        variants = listOf("500mg Tablet", "650mg Tablet")),
-    Medicine("Paracetamol", "120mg/5ml", "Syrup",
-        variants = listOf("120mg/5ml Syrup", "250mg/5ml Syrup")),
-    Medicine("Amoxicillin", "500mg", "Capsule", brand = "Amoxil",
-        variants = listOf("250mg Capsule", "500mg Capsule")),
-    Medicine("Ibuprofen", "400mg", "Tablet", brand = "Brufen",
-        variants = listOf("400mg Tablet", "600mg Tablet")),
-    Medicine("Cetirizine", "10mg", "Tablet", brand = "Zyrtec",
-        variants = listOf("10mg Tablet")),
-    Medicine("Azithromycin", "250mg", "Tablet", brand = "Zithromax",
-        variants = listOf("250mg Tablet", "500mg Tablet")),
-    Medicine("Omeprazole", "20mg", "Capsule", brand = "Losec",
-        variants = listOf("20mg Capsule", "40mg Capsule")),
-    Medicine("Metformin", "500mg", "Tablet", brand = "Glucophage",
-        variants = listOf("500mg Tablet", "850mg Tablet", "1000mg Tablet")),
-    Medicine("Amlodipine", "5mg", "Tablet", brand = "Norvasc",
-        variants = listOf("5mg Tablet", "10mg Tablet")),
-    Medicine("Losartan", "50mg", "Tablet", brand = "Cozaar",
-        variants = listOf("50mg Tablet", "100mg Tablet"))
-)
-
 private const val MAX_VISIBLE_RESULTS = 6
 
 @Composable
 fun SmartSearchScreen(
-    prescriptionAttached: Boolean,
     onBack: () -> Unit,
     onChangePhoto: () -> Unit,
     onProceed: (label: String, variant: String) -> Unit
@@ -118,15 +63,33 @@ fun SmartSearchScreen(
     var query by remember { mutableStateOf("") }
     var showResults by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Medicine?>(null) }
-    var variant by remember { mutableStateOf<String?>(null) }
+    var variant by remember { mutableStateOf<Medicine?>(null) }
+    var results by remember { mutableStateOf<List<Medicine>>(emptyList()) }
+    var variants by remember { mutableStateOf<List<Medicine>>(emptyList()) }
 
     val focusManager = LocalFocusManager.current
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val matches = remember(query) {
-        sampleMedicines.filter { it.matches(query) }
-            .sortedBy { it.relevance(query) }
-            .take(MAX_VISIBLE_RESULTS)
+    LaunchedEffect(query) {
+        val needle = query.trim()
+        if (needle.isEmpty()) {
+            results = emptyList()
+        } else {
+            delay(220)
+            results = runCatching {
+                AppGraph.medicines.search(needle, MAX_VISIBLE_RESULTS.toLong())
+            }.getOrNull().orEmpty()
+        }
+    }
+
+    LaunchedEffect(selected) {
+        val molecule = selected?.genericName
+        variant = null
+        variants = if (molecule.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching { AppGraph.medicines.variantsOf(molecule) }.getOrNull().orEmpty()
+        }
     }
 
     Scaffold(
@@ -137,10 +100,10 @@ fun SmartSearchScreen(
             SearchFooter(
                 enabled = selected != null && variant != null,
                 onProceed = {
-                    val medicine = selected
                     val chosen = variant
-                    if (medicine != null && chosen != null) {
-                        onProceed(medicine.heading, chosen)
+                    if (chosen != null) {
+                        CartStore.add(chosen, 1)
+                        onProceed(chosen.title, chosen.strength)
                     }
                 }
             )
@@ -179,11 +142,11 @@ fun SmartSearchScreen(
             Spacer(Modifier.height(10.dp))
 
             if (showResults && query.isNotBlank()) {
-                if (matches.isEmpty()) {
+                if (results.isEmpty()) {
                     NoMatchesLabel(query = query)
                 } else {
                     ResultCard(
-                        medicines = matches,
+                        medicines = results,
                         selected = selected,
                         onSelect = { medicine ->
                             selected = medicine
@@ -201,14 +164,15 @@ fun SmartSearchScreen(
                 Spacer(Modifier.height(14.dp))
                 SelectedMedicineCard(
                     medicine = chosen,
-                    variant = variant,
+                    variants = variants,
+                    selected = variant,
                     onVariantSelected = { variant = it }
                 )
             }
 
-            if (prescriptionAttached) {
+            if (CartStore.slipStoragePath != null) {
                 Spacer(Modifier.height(14.dp))
-                AttachedSlipCard(onChangePhoto = onChangePhoto)
+                AttachedSlipCard(fileName = CartStore.slipFileName, onChangePhoto = onChangePhoto)
             }
 
             Spacer(Modifier.height(24.dp))
@@ -448,8 +412,9 @@ private fun NoMatchesLabel(query: String) {
 @Composable
 private fun SelectedMedicineCard(
     medicine: Medicine,
-    variant: String?,
-    onVariantSelected: (String) -> Unit
+    variants: List<Medicine>,
+    selected: Medicine?,
+    onVariantSelected: (Medicine) -> Unit
 ) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
@@ -468,7 +433,7 @@ private fun SelectedMedicineCard(
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = medicine.heading,
+                text = medicine.name,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 color = DarkSlate
@@ -484,10 +449,12 @@ private fun SelectedMedicineCard(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                medicine.variants.forEach { option ->
+                variants.forEach { option ->
                     VariantPill(
-                        label = option,
-                        isSelected = option == variant,
+                        label = listOf(option.strength, option.form)
+                            .filter { it.isNotBlank() }
+                            .joinToString(" "),
+                        isSelected = option == selected,
                         onClick = { onVariantSelected(option) }
                     )
                 }
@@ -529,7 +496,7 @@ private fun VariantPill(label: String, isSelected: Boolean, onClick: () -> Unit)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun AttachedSlipCard(onChangePhoto: () -> Unit) {
+private fun AttachedSlipCard(fileName: String?, onChangePhoto: () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
         modifier = Modifier
@@ -547,13 +514,14 @@ private fun AttachedSlipCard(onChangePhoto: () -> Unit) {
             Spacer(Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Prescription attached",
+                    text = fileName?.takeIf { it.isNotBlank() }?.let { "Slip: $it" }
+                        ?: "Prescription slip attached",
                     fontSize = 14.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = DarkSlate
                 )
                 Text(
-                    text = "We will verify this against your search",
+                    text = "The pharmacy you reserve with can open it",
                     fontSize = 12.5.sp,
                     color = SlateMedium
                 )

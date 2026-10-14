@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MediFlow</string>
+    <string name="app_tagline">Your Medicine, Your Pharmacy, Your Time</string>
+    <string name="gcm_defaultSenderId" translatable="false">827995825214</string>
+    <string name="google_api_key" translatable="false">AIzaSyACHT2--KMGtEMkGYbquBQe-39bLPO9XX8</string>
+    <string name="google_app_id" translatable="false">1:827995825214:android:dd88751752532694c81d6f</string>
+    <string name="google_crash_reporting_api_key" translatable="false">AIzaSyACHT2--KMGtEMkGYbquBQe-39bLPO9XX8</string>
+    <string name="google_storage_bucket" translatable="false">mediflow-d4ccc.firebasestorage.app</string>
+    <string name="login_title">Sign In</string>
+    <string name="project_id" translatable="false">mediflow-d4ccc</string>
+    <string name="signup_title">Create Account</string>
+    <string name="slmc_badge">SLMC Compliant Data Protection</string>
+    <style name="Theme.MediFlow" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

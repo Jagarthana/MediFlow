@@ -2,11 +2,13 @@ package com.mediflow.app.ui.screens
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
@@ -24,33 +26,38 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.model.Medicine
+import com.mediflow.app.data.model.PharmacyInfo
+import com.mediflow.app.data.model.Reservation
+import com.mediflow.app.data.model.ReservationStatus
+import com.mediflow.app.data.model.UserProfile
 import com.mediflow.app.ui.theme.*
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Screen A1 — Admin Dashboard (Variant B)
+ * Screen A1 — Admin Dashboard
  *
- * The national console: how big the network is, how much of it is waiting on
- * SLMC verification, and the three things an administrator actually does from
- * a phone. The four KPI cards are the top of the screen because they are the
- * only numbers that decide whether the rest of the day is routine, and the
- * pending-approvals queue sits directly under them so the amber "8 Pending
- * SLMC" card is one scroll away from the queue it counts.
+ * The national console. The four KPI cards are the top of the screen because they
+ * are the only numbers that decide whether the rest of the day is routine, and the
+ * live reservations feed sits directly under them so an open hold is one scroll
+ * away from the counts that include it.
  *
  * A1 owns the admin `Scaffold` and the admin bottom navigation (Dashboard,
  * Pharmacies, Medicines, Reports, Profile) the same way Figma P1 owns the
  * pharmacist navigation — later A-series screens slot in as panes here rather
  * than as separate nav destinations.
  *
- * Everything is local simulated state: the KPI figures are UI-phase
- * scaffolding for the admin summary endpoint, and "Mark as Reviewed" removes
- * the application from the local queue (which decrements the amber KPI) after
- * a short delay instead of calling a backend.
+ * Every count, card and row below is read from Firestore through `AppGraph.admin`
+ * snapshot listeners; writes go back through the same repository and the listeners
+ * re-render the panes. The one number that is not measured is the uptime KPI.
  *
  * WCAG 2.1 AA: cards carry a full-sentence semantic label so the value never
  * depends on colour alone, every control is 48dp+, and destructive-free
@@ -66,44 +73,13 @@ private enum class AdminTab(val label: String, val icon: ImageVector) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UI-phase data — pharmacy network summary and the SLMC approval queue
+// Console feeds — every number here is a Firestore snapshot
 // ─────────────────────────────────────────────────────────────────────────────
 
-private data class PendingApplication(
-    val id: Int,
-    val pharmacy: String,
-    val slmcReg: String,
-    val applicant: String,
-    val district: String,
-    val submittedAt: String,
-    val documents: List<String>
-)
-
-private val standardDocuments = listOf(
-    "SLMC Registration Certificate",
-    "Business Registration (BR) Certificate",
-    "Pharmacist-in-Charge Licence",
-    "Premises Floor Plan & Photos"
-)
-
-private val seedApplications: List<PendingApplication> = listOf(
-    PendingApplication(1, "Lanka Pharmacy Wattala", "PHL-984", "Mr. Sunil Bandara", "Gampaha", "Today, 09:15 AM", standardDocuments),
-    PendingApplication(2, "Suwasetha Pharmacy Kadawatha", "PHL-1027", "Ms. Renuka Fernando", "Gampaha", "Today, 08:40 AM", standardDocuments),
-    PendingApplication(3, "Rajagiriya Care Pharmacy", "PHL-0871", "Dr. Ajith Perera", "Colombo", "Yesterday, 06:20 PM", standardDocuments),
-    PendingApplication(4, "MediPlus Pharmacy Nugegoda", "PHL-1102", "Mrs. Dilani Silva", "Colombo", "Yesterday, 03:05 PM", standardDocuments),
-    PendingApplication(5, "HealthFirst Pharmacy Kandy", "PHL-0764", "Mr. Kasun Rathnayake", "Kandy", "Yesterday, 11:48 AM", standardDocuments),
-    PendingApplication(6, "Serendib Pharmacy Galle", "PHL-0995", "Ms. Tharushi Jayawardena", "Galle", "03 Oct 2026, 04:30 PM", standardDocuments),
-    PendingApplication(7, "New Life Pharmacy Jaffna", "PHL-1043", "Mr. Piratheepan Kumar", "Jaffna", "03 Oct 2026, 10:12 AM", standardDocuments),
-    PendingApplication(8, "City Drug Store Kurunegala", "PHL-0908", "Mrs. Chandima Ekanayake", "Kurunegala", "02 Oct 2026, 02:55 PM", standardDocuments)
-)
-
-/** Registered pharmacies and catalog size stay fixed; only the queue is live. */
-private const val REGISTERED_PHARMACIES = "142"
-private const val CATALOG_MEDICINES = "1,247"
+/** No telemetry endpoint exists, so this is set decoration, not a measurement. */
 private const val NETWORK_UPTIME = "98.5%"
 
-/** How many queue cards the dashboard shows before handing off to Pharmacies. */
-private const val QUEUE_PREVIEW_LIMIT = 3
+private fun counted(size: Int?): String = size?.toString() ?: "Counting"
 
 private data class Kpi(
     val value: String,
@@ -125,21 +101,28 @@ fun AdminDashboardScreen(
     onAddMedicine: () -> Unit = {}
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(AdminTab.DASHBOARD) }
-    var isRefreshing by remember { mutableStateOf(false) }
-    var isGeneratingReport by remember { mutableStateOf(false) }
+    var syncTick by remember { mutableIntStateOf(0) }
+    var isSyncing by remember { mutableStateOf(true) }
+    var isBusy by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
+    var feedFailure by remember { mutableStateOf<String?>(null) }
 
-    // Seeded three minutes in the past so the first frame reads "3 minutes ago".
-    var lastSynced by remember { mutableLongStateOf(System.currentTimeMillis() - 3 * 60 * 1000) }
+    var lastSynced by remember { mutableLongStateOf(0L) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
-    val pending = remember { mutableStateListOf<PendingApplication>().apply { addAll(seedApplications) } }
-    var reviewId by rememberSaveable { mutableIntStateOf(-1) }
-    val reviewApplication = pending.firstOrNull { it.id == reviewId }
+    var pharmacies by remember { mutableStateOf<List<PharmacyInfo>?>(null) }
+    var medicines by remember { mutableStateOf<List<Medicine>?>(null) }
+    var users by remember { mutableStateOf<List<UserProfile>?>(null) }
+    var reservations by remember { mutableStateOf<List<Reservation>?>(null) }
+
+    var selectedPharmacyId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedUserId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showingManageUsers by remember { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    // Keeps the relative timestamp honest without a manual refresh.
+    // Keeps the relative timestamps honest without a manual refresh.
     LaunchedEffect(Unit) {
         while (true) {
             delay(30_000)
@@ -147,58 +130,160 @@ fun AdminDashboardScreen(
         }
     }
 
-    fun touch() {
-        lastSynced = System.currentTimeMillis()
-        now = lastSynced
-    }
-
-    fun refresh() {
-        if (isRefreshing) return
-        scope.launch {
-            isRefreshing = true
-            delay(900)
-            isRefreshing = false
-            touch()
-            snackbarHostState.showSnackbar("Console data synced")
+    // One listener per collection: the console never polls, it is told. Re-attaching the
+    // four of them is all "Refresh" does.
+    LaunchedEffect(syncTick) {
+        val admin = AppGraph.admin
+        var awaiting = 4
+        fun settle() {
+            if (awaiting > 0) {
+                awaiting -= 1
+                if (awaiting == 0) {
+                    isSyncing = false
+                    lastSynced = System.currentTimeMillis()
+                    now = lastSynced
+                }
+            }
+        }
+        isSyncing = true
+        coroutineScope {
+            launch {
+                runCatching { admin.observePharmacies().collect { pharmacies = it; settle() } }
+                    .onFailure { feedFailure = it.message; settle() }
+            }
+            launch {
+                runCatching { admin.observeMedicines().collect { medicines = it; settle() } }
+                    .onFailure { feedFailure = it.message; settle() }
+            }
+            launch {
+                runCatching { admin.observeUsers().collect { users = it; settle() } }
+                    .onFailure { feedFailure = it.message; settle() }
+            }
+            launch {
+                runCatching { admin.observeReservations().collect { reservations = it; settle() } }
+                    .onFailure { feedFailure = it.message; settle() }
+            }
         }
     }
 
-    val kpis = remember(pending.size) {
-        listOf(
-            Kpi(
-                value = REGISTERED_PHARMACIES,
-                label = "Pharmacies",
-                caption = "Registered network",
-                tint = ForestEmerald,
-                icon = Icons.Rounded.Storefront,
-                description = "$REGISTERED_PHARMACIES pharmacies registered on the network"
-            ),
-            Kpi(
-                value = "${pending.size}",
-                label = "Pending SLMC",
-                caption = "Awaiting approval",
-                tint = AmberWarning,
-                icon = Icons.Rounded.PendingActions,
-                description = "${pending.size} pharmacy registrations awaiting SLMC approval"
-            ),
-            Kpi(
-                value = CATALOG_MEDICINES,
-                label = "Medicines",
-                caption = "In master catalog",
-                tint = HealthcareBlue,
-                icon = Icons.Rounded.Medication,
-                description = "$CATALOG_MEDICINES medicines in the master catalog"
-            ),
-            Kpi(
-                value = NETWORK_UPTIME,
-                label = "Uptime",
-                caption = "Rolling 30 days",
-                tint = MintGreen,
-                icon = Icons.Rounded.TrendingUp,
-                description = "$NETWORK_UPTIME platform uptime over the last 30 days"
-            )
-        )
+    fun refresh() {
+        if (isSyncing) return
+        feedFailure = null
+        syncTick += 1
+        scope.launch { snackbarHostState.showSnackbar("Console data synced") }
     }
+
+    fun savePharmacy(updated: PharmacyInfo) {
+        if (isBusy) return
+        isBusy = true
+        scope.launch {
+            AppGraph.admin.savePharmacy(updated)
+                .onSuccess { snackbarHostState.showSnackbar("${updated.name} updated") }
+                .onFailure {
+                    snackbarHostState.showSnackbar(it.message ?: "The branch could not be saved.")
+                }
+            isBusy = false
+            selectedPharmacyId = null
+        }
+    }
+
+    fun setPharmacyStatus(pharmacyId: String, status: String, message: String) {
+        if (isBusy) return
+        isBusy = true
+        scope.launch {
+            AppGraph.admin.setPharmacyStatus(pharmacyId, status)
+                .onSuccess { snackbarHostState.showSnackbar(message) }
+                .onFailure {
+                    snackbarHostState.showSnackbar(it.message ?: "The status could not be changed.")
+                }
+            isBusy = false
+            selectedPharmacyId = null
+        }
+    }
+
+    fun setUserStatus(uid: String, status: String, message: String) {
+        if (isBusy) return
+        isBusy = true
+        scope.launch {
+            AppGraph.admin.setUserStatus(uid, status)
+                .onSuccess { snackbarHostState.showSnackbar(message) }
+                .onFailure {
+                    snackbarHostState.showSnackbar(it.message ?: "The account could not be changed.")
+                }
+            isBusy = false
+            selectedUserId = null
+        }
+    }
+
+    /** Writes the signed-in admin's own `users` document; the feed re-renders it. */
+    fun saveAdminProfile(updated: UserProfile) {
+        if (isSaving) return
+        isSaving = true
+        scope.launch {
+            AppGraph.auth.writeProfile(updated)
+                .onSuccess { snackbarHostState.showSnackbar("Administrator profile saved") }
+                .onFailure {
+                    snackbarHostState.showSnackbar(it.message ?: "The profile could not be saved.")
+                }
+            isSaving = false
+        }
+    }
+
+    val adminUid = AppGraph.currentProfile?.uid
+    val adminProfile = users?.firstOrNull { it.uid == adminUid } ?: AppGraph.currentProfile
+
+    val selectedPharmacy = selectedPharmacyId?.let { id ->
+        pharmacies?.firstOrNull { it.pharmacyId == id }
+    }
+    val userRows = users?.map { it.toAdminUserRow() }.orEmpty()
+    val selectedUser = selectedUserId?.let { id -> userRows.firstOrNull { it.id == id } }
+
+    val holds = reservations?.count {
+        it.status == ReservationStatus.RESERVED || it.status == ReservationStatus.READY
+    }
+    val approvedPharmacies = pharmacies?.count { it.status.equals("approved", ignoreCase = true) }
+    val pharmacyCount = pharmacies?.size
+    val medicineCount = medicines?.size
+
+    val kpis = listOf(
+        Kpi(
+            value = counted(pharmacyCount),
+            label = "Pharmacies",
+            caption = "${approvedPharmacies?.toString() ?: "Counting"} open to patients",
+            tint = ForestEmerald,
+            icon = Icons.Rounded.Storefront,
+            description = "${pharmacyCount?.toString() ?: "Counting"} pharmacies on the network"
+        ),
+        Kpi(
+            value = counted(holds),
+            label = "Open holds",
+            caption = "Reserved or ready",
+            tint = AmberWarning,
+            icon = Icons.Rounded.PendingActions,
+            description = "${holds?.toString() ?: "Counting"} reservations awaiting collection"
+        ),
+        Kpi(
+            value = counted(medicineCount),
+            label = "Medicines",
+            caption = "In master catalog",
+            tint = HealthcareBlue,
+            icon = Icons.Rounded.Medication,
+            description = "${medicineCount?.toString() ?: "Counting"} medicines in the master catalog"
+        ),
+        Kpi(
+            value = NETWORK_UPTIME,
+            label = "Uptime",
+            caption = "Rolling 30 days",
+            tint = MintGreen,
+            icon = Icons.Rounded.TrendingUp,
+            description = "$NETWORK_UPTIME platform uptime over the last 30 days"
+        )
+    )
+
+    val recentHolds = reservations.orEmpty()
+        .filter { it.status == ReservationStatus.RESERVED || it.status == ReservationStatus.READY }
+        .sortedByDescending { it.createdAtMillis }
+        .take(4)
 
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
@@ -206,15 +291,21 @@ fun AdminDashboardScreen(
             snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 AdminTopBar(
-                    subtitle = "Last synced ${relativeSyncTime(lastSynced, now)}",
-                    isRefreshing = isRefreshing,
+                    subtitle = if (lastSynced == 0L) "Connecting to the network…"
+                        else "Last synced ${relativeSyncTime(lastSynced, now)}",
+                    isRefreshing = isSyncing,
                     onRefresh = ::refresh
                 )
             },
             bottomBar = {
                 AdminBottomBar(
                     selectedTab = selectedTab,
-                    onTabSelected = { selectedTab = it }
+                    onTabSelected = {
+                        selectedTab = it
+                        selectedPharmacyId = null
+                        selectedUserId = null
+                        showingManageUsers = false
+                    }
                 )
             }
         ) { innerPadding ->
@@ -223,7 +314,7 @@ fun AdminDashboardScreen(
                     .fillMaxSize()
                     .padding(innerPadding)
             ) {
-                if (isRefreshing || isGeneratingReport) {
+                if (isSyncing || isBusy) {
                     LinearProgressIndicator(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -233,70 +324,144 @@ fun AdminDashboardScreen(
                     )
                 }
 
-                when (selectedTab) {
-                    AdminTab.DASHBOARD -> AdminDashboardPane(
+                feedFailure?.let { message ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        color = ErrorRed.copy(alpha = 0.08f),
+                        border = BorderStroke(1.dp, ErrorRed.copy(alpha = 0.3f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.CloudOff,
+                                contentDescription = null,
+                                tint = ErrorRed,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "The console could not read the network: $message",
+                                fontSize = 12.sp,
+                                color = DarkSlate,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(onClick = ::refresh) {
+                                Icon(Icons.Rounded.Refresh, "Retry", tint = ErrorRed)
+                            }
+                        }
+                    }
+                }
+
+                when {
+                    selectedPharmacy != null -> {
+                        val pharmacy = selectedPharmacy
+                        PharmacyDetailScreen(
+                            pharmacy = pharmacy,
+                            isBusy = isBusy,
+                            onSave = ::savePharmacy,
+                            onApprove = {
+                                setPharmacyStatus(
+                                    pharmacy.pharmacyId,
+                                    "approved",
+                                    "${pharmacy.name} approved — patients can now find it"
+                                )
+                            },
+                            onReject = {
+                                setPharmacyStatus(
+                                    pharmacy.pharmacyId,
+                                    "rejected",
+                                    "${pharmacy.name} rejected"
+                                )
+                            },
+                            onDeactivate = {
+                                setPharmacyStatus(
+                                    pharmacy.pharmacyId,
+                                    "rejected",
+                                    "${pharmacy.name} removed from patient searches"
+                                )
+                            },
+                            onBack = { selectedPharmacyId = null }
+                        )
+                    }
+
+                    selectedUser != null -> {
+                        val user = selectedUser
+                        UserDetailScreen(
+                            user = user,
+                            isBusy = isBusy,
+                            onDisable = {
+                                setUserStatus(user.id, "disabled", "${user.name} can no longer sign in")
+                            },
+                            onEnable = {
+                                setUserStatus(user.id, "active", "${user.name} can sign in again")
+                            },
+                            onBack = { selectedUserId = null }
+                        )
+                    }
+
+                    showingManageUsers -> {
+                        ManageUsersScreen(
+                            users = userRows,
+                            onUserClick = { user -> selectedUserId = user.id }
+                        )
+                    }
+
+                    selectedTab == AdminTab.DASHBOARD -> AdminDashboardPane(
                         kpis = kpis,
-                        pending = pending,
-                        isGeneratingReport = isGeneratingReport,
-                        onReviewApplication = { reviewId = it },
+                        recentHolds = recentHolds,
+                        holdsLoading = reservations == null,
+                        now = now,
                         onOpenPharmacies = {
                             selectedTab = AdminTab.PHARMACIES
                         },
-                        onOpenMedicines = {
-                            selectedTab = AdminTab.MEDICINES
-                        },
                         onRegisterPharmacy = onRegisterPharmacy,
                         onAddMedicine = onAddMedicine,
+                        onManageUsers = {
+                            showingManageUsers = true
+                        },
                         onGenerateReports = {
-                            scope.launch {
-                                isGeneratingReport = true
-                                delay(1200)
-                                isGeneratingReport = false
-                                touch()
-                                selectedTab = AdminTab.REPORTS
-                                snackbarHostState.showSnackbar(
-                                    "Report generated for $REGISTERED_PHARMACIES pharmacies · $CATALOG_MEDICINES medicines"
-                                )
-                            }
+                            selectedTab = AdminTab.REPORTS
                         }
                     )
 
-                    AdminTab.PROFILE -> AdminProfilePane(onLogout = onLogout)
-
-                    AdminTab.PHARMACIES -> AdminPharmaciesTabPane(
-                        onRegisterPharmacy = onRegisterPharmacy,
-                        onReviewApplication = { reviewId = it },
-                        pending = pending
+                    selectedTab == AdminTab.PHARMACIES -> PharmacyListScreen(
+                        pharmacies = pharmacies.orEmpty(),
+                        onAddClick = onRegisterPharmacy,
+                        onPharmacyClick = { pharmacy ->
+                            selectedPharmacyId = pharmacy.pharmacyId
+                        }
                     )
 
-                    AdminTab.MEDICINES -> AdminMedicinesTabPane(
+                    selectedTab == AdminTab.REPORTS -> AdminReportsScreen(
+                        reservations = reservations,
+                        pharmacies = pharmacies,
+                        medicines = medicines
+                    )
+
+                    selectedTab == AdminTab.PROFILE -> AdminProfilePane(
+                        profile = adminProfile,
+                        pharmacyCount = pharmacyCount,
+                        medicineCount = medicineCount,
+                        userCount = users?.size,
+                        isSaving = isSaving,
+                        onLogout = onLogout,
+                        onManageUsers = {
+                            showingManageUsers = true
+                        },
+                        onSave = ::saveAdminProfile
+                    )
+
+                    selectedTab == AdminTab.MEDICINES -> AdminMedicinesTabPane(
+                        medicines = medicines,
                         onAddMedicine = onAddMedicine
                     )
-
-                    else -> PendingAdminTab(tab = selectedTab)
                 }
             }
-        }
-
-        reviewApplication?.let { application ->
-            ReviewDocumentationSheet(
-                application = application,
-                onDismiss = { reviewId = -1 },
-                onReviewed = {
-                    val remaining = pending.size - 1
-                    scope.launch {
-                        isRefreshing = true
-                        delay(600)
-                        pending.removeAll { it.id == application.id }
-                        isRefreshing = false
-                        touch()
-                        reviewId = -1
-                        snackbarHostState.showSnackbar(
-                            "${application.pharmacy} marked as reviewed · $remaining still pending SLMC"
-                        )
-                    }
-                }
-            )
         }
     }
 }
@@ -379,19 +544,19 @@ private fun AdminBrandMark() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dashboard pane — KPIs, approvals queue, quick actions
+// Dashboard pane — KPIs, live reservations, quick actions
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
 private fun AdminDashboardPane(
     kpis: List<Kpi>,
-    pending: List<PendingApplication>,
-    isGeneratingReport: Boolean,
-    onReviewApplication: (Int) -> Unit,
+    recentHolds: List<Reservation>,
+    holdsLoading: Boolean,
+    now: Long,
     onOpenPharmacies: () -> Unit,
-    onOpenMedicines: () -> Unit,
     onRegisterPharmacy: () -> Unit,
     onAddMedicine: () -> Unit,
+    onManageUsers: () -> Unit = {},
     onGenerateReports: () -> Unit
 ) {
     Column(
@@ -405,30 +570,42 @@ private fun AdminDashboardPane(
 
         Spacer(Modifier.height(22.dp))
 
-        PendingApprovalsHeader(
-            total = pending.size,
-            shown = minOf(pending.size, QUEUE_PREVIEW_LIMIT)
+        SectionHeader(
+            title = "Live Reservations",
+            caption = "Holds patients have placed at branches right now"
         )
 
         Spacer(Modifier.height(10.dp))
 
-        val preview = pending.take(QUEUE_PREVIEW_LIMIT)
-        if (preview.isEmpty()) {
-            EmptyApprovalsState()
+        if (recentHolds.isEmpty()) {
+            EmptyHoldsState(loading = holdsLoading)
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                preview.forEach { application ->
-                    PendingApprovalCard(
-                        application = application,
-                        onReview = { onReviewApplication(application.id) }
-                    )
+                recentHolds.forEach { reservation ->
+                    HoldFeedCard(reservation = reservation, now = now)
                 }
             }
 
-            if (pending.size > preview.size) {
-                ViewAllRow(
-                    count = pending.size,
-                    onClick = onOpenPharmacies
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenPharmacies)
+                    .minimumInteractiveComponentSize()
+                    .padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Open the pharmacy registry",
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ForestEmerald,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(
+                    imageVector = Icons.Rounded.ChevronRight,
+                    contentDescription = null,
+                    tint = ForestEmerald,
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }
@@ -440,10 +617,19 @@ private fun AdminDashboardPane(
         Spacer(Modifier.height(10.dp))
 
         QuickActions(
-            isGeneratingReport = isGeneratingReport,
             onRegisterPharmacy = onRegisterPharmacy,
             onAddMedicine = onAddMedicine,
+            onManageUsers = onManageUsers,
             onGenerateReports = onGenerateReports
+        )
+
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = "Counts come from the Firestore collections as they change. Uptime has no " +
+                "measurement behind it and is shown as decoration.",
+            fontSize = 11.sp,
+            color = SlateLight,
+            lineHeight = 15.sp
         )
     }
 }
@@ -518,52 +704,18 @@ private fun KpiCard(kpi: Kpi, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun PendingApprovalsHeader(total: Int, shown: Int) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "Pending Approvals Queue",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = DarkSlate
-            )
-            Text(
-                text = if (total == 0) "Nothing waiting on SLMC verification"
-                       else "Showing $shown of $total awaiting SLMC verification",
-                fontSize = 12.sp,
-                color = SlateMedium
-            )
-        }
-        if (total > 0) {
-            Surface(
-                shape = CircleShape,
-                color = AmberWarning.copy(alpha = 0.14f),
-                modifier = Modifier.semantics { contentDescription = "$total pending approvals" }
-            ) {
-                Text(
-                    text = "$total",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = AmberWarning,
-                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 5.dp)
-                )
-            }
-        }
-    }
-}
+private fun HoldFeedCard(reservation: Reservation, now: Long) {
+    val ready = reservation.status == ReservationStatus.READY
+    val tint = if (ready) ForestEmerald else AmberWarning
+    val itemCount = reservation.items.sumOf { it.quantity }
 
-@Composable
-private fun PendingApprovalCard(application: PendingApplication, onReview: () -> Unit) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onReview)
             .semantics {
                 contentDescription =
-                    "${application.pharmacy}, SLMC registration ${application.slmcReg}, pending approval. Tap to review documentation."
+                    "${reservation.reference} at ${reservation.pharmacyName} for " +
+                        "${reservation.patientName}, ${if (ready) "ready for collection" else "reserved"}."
             },
         shape = RoundedCornerShape(16.dp),
         color = SurfaceWhite,
@@ -575,20 +727,20 @@ private fun PendingApprovalCard(application: PendingApplication, onReview: () ->
                     modifier = Modifier
                         .size(42.dp)
                         .clip(RoundedCornerShape(13.dp))
-                        .background(AmberWarning.copy(alpha = 0.12f)),
+                        .background(tint.copy(alpha = 0.12f)),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Storefront,
+                        imageVector = Icons.Rounded.ShoppingCart,
                         contentDescription = null,
-                        tint = AmberWarning,
+                        tint = tint,
                         modifier = Modifier.size(21.dp)
                     )
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = application.pharmacy,
+                        text = reservation.patientName.ifBlank { "Patient" },
                         fontSize = 15.5.sp,
                         fontWeight = FontWeight.Bold,
                         color = DarkSlate,
@@ -597,55 +749,32 @@ private fun PendingApprovalCard(application: PendingApplication, onReview: () ->
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        text = "SLMC Reg: ${application.slmcReg}",
+                        text = reservation.pharmacyName,
                         fontSize = 12.5.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = SlateMedium
+                        color = SlateMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Spacer(Modifier.width(10.dp))
-                PendingReviewPill()
+                HoldStatusPill(label = if (ready) "Ready" else "Reserved", color = tint)
             }
 
             Spacer(Modifier.height(10.dp))
             Text(
-                text = "${application.district} · Submitted ${application.submittedAt}",
+                text = "Ref ${reservation.reference} · $itemCount item" +
+                    (if (itemCount == 1) "" else "s") + " · ${holdTime(reservation.createdAtMillis, now)}",
                 fontSize = 11.5.sp,
                 color = SlateLight
             )
-
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = onReview,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    .semantics {
-                        contentDescription = "Review documentation for ${application.pharmacy}"
-                    },
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.5.dp, ForestEmerald),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = ForestEmerald)
-            ) {
-                Text(
-                    text = "Review Documentation",
-                    fontSize = 13.5.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(Modifier.width(6.dp))
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.ArrowForward,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
         }
     }
 }
 
 @Composable
-private fun PendingReviewPill() {
-    Surface(shape = CircleShape, color = AmberWarning.copy(alpha = 0.14f)) {
+private fun HoldStatusPill(label: String, color: Color) {
+    Surface(shape = CircleShape, color = color.copy(alpha = 0.14f)) {
         Row(
             modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -654,48 +783,21 @@ private fun PendingReviewPill() {
                 modifier = Modifier
                     .size(7.dp)
                     .clip(CircleShape)
-                    .background(AmberWarning)
+                    .background(color)
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = "Pending",
+                text = label,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
-                color = AmberWarning
+                color = color
             )
         }
     }
 }
 
 @Composable
-private fun ViewAllRow(count: Int, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .minimumInteractiveComponentSize()
-            .semantics { contentDescription = "View all $count pending applications" }
-            .padding(horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = "View all $count pending applications",
-            fontSize = 13.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = ForestEmerald,
-            modifier = Modifier.weight(1f)
-        )
-        Icon(
-            imageVector = Icons.Rounded.ChevronRight,
-            contentDescription = null,
-            tint = ForestEmerald,
-            modifier = Modifier.size(20.dp)
-        )
-    }
-}
-
-@Composable
-private fun EmptyApprovalsState() {
+private fun EmptyHoldsState(loading: Boolean) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -718,14 +820,15 @@ private fun EmptyApprovalsState() {
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            text = "Approval queue is clear",
+            text = if (loading) "Reading the reservations collection…" else "No holds open right now",
             fontSize = 15.sp,
             fontWeight = FontWeight.Bold,
             color = DarkSlate
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            text = "Every submitted registration has been reviewed.",
+            text = if (loading) "The cards appear as soon as the first snapshot lands."
+                else "Every hold a patient placed has been collected or cancelled.",
             fontSize = 12.5.sp,
             color = SlateMedium,
             textAlign = TextAlign.Center
@@ -756,9 +859,9 @@ private fun SectionHeader(title: String, caption: String) {
 
 @Composable
 private fun QuickActions(
-    isGeneratingReport: Boolean,
     onRegisterPharmacy: () -> Unit,
     onAddMedicine: () -> Unit,
+    onManageUsers: () -> Unit = {},
     onGenerateReports: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -810,243 +913,45 @@ private fun QuickActions(
 
             OutlinedButton(
                 onClick = onGenerateReports,
-                enabled = !isGeneratingReport,
                 modifier = Modifier
                     .weight(1f)
                     .height(52.dp)
-                    .semantics { contentDescription = "Generate compliance reports" },
+                    .semantics { contentDescription = "Open the network reports" },
                 shape = RoundedCornerShape(13.dp),
                 border = BorderStroke(1.5.dp, MintGreen.copy(alpha = 0.6f)),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = MintGreen),
                 contentPadding = PaddingValues(horizontal = 8.dp)
             ) {
-                if (isGeneratingReport) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(17.dp),
-                        color = MintGreen,
-                        strokeWidth = 2.dp
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = "Working…",
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1
-                    )
-                } else {
-                    Icon(Icons.Rounded.Assessment, null, modifier = Modifier.size(17.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = "Generate Reports",
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
+                Icon(Icons.Rounded.Assessment, null, modifier = Modifier.size(17.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "View Reports",
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
-    }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Review Documentation sheet
-// ─────────────────────────────────────────────────────────────────────────────
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ReviewDocumentationSheet(
-    application: PendingApplication,
-    onDismiss: () -> Unit,
-    onReviewed: () -> Unit
-) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        containerColor = SurfaceWhite,
-        sheetState = sheetState
-    ) {
-        Column(
+        Button(
+            onClick = onManageUsers,
             modifier = Modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 28.dp)
+                .height(50.dp)
+                .semantics { contentDescription = "Manage system users" },
+            shape = RoundedCornerShape(13.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = DarkSlate,
+                contentColor = Color.White
+            )
         ) {
-            Text(
-                text = "Review Documentation",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                color = DarkSlate
-            )
-            Spacer(Modifier.height(3.dp))
-            Text(
-                text = "SLMC registration evidence submitted by the applicant",
-                fontSize = 12.5.sp,
-                color = SlateMedium
-            )
-
-            Spacer(Modifier.height(16.dp))
-
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                color = AmberWarning.copy(alpha = 0.08f),
-                border = BorderStroke(1.dp, AmberWarning.copy(alpha = 0.3f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(RoundedCornerShape(13.dp))
-                            .background(AmberWarning.copy(alpha = 0.16f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Storefront,
-                            contentDescription = null,
-                            tint = AmberWarning,
-                            modifier = Modifier.size(21.dp)
-                        )
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = application.pharmacy,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = DarkSlate,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = "SLMC Reg: ${application.slmcReg}",
-                            fontSize = 12.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = SlateMedium
-                        )
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    PendingReviewPill()
-                }
-            }
-
-            Spacer(Modifier.height(20.dp))
-
-            SheetSectionLabel("Application details")
-            DetailRow(label = "Applicant", value = application.applicant)
-            DetailRow(label = "District", value = application.district)
-            DetailRow(label = "Submitted", value = application.submittedAt)
-            DetailRow(label = "Status", value = "Awaiting SLMC verification", valueColor = AmberWarning)
-
-            Spacer(Modifier.height(20.dp))
-
-            SheetSectionLabel("Submitted documents (${application.documents.size})")
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                application.documents.forEach { document ->
-                    DocumentRow(name = document)
-                }
-            }
-
-            Spacer(Modifier.height(22.dp))
-
-            MediFlowPrimaryButton(
-                text = "Mark as Reviewed",
-                icon = Icons.Rounded.VerifiedUser,
-                contentDescription = "Mark ${application.pharmacy} documentation as reviewed",
-                onClick = onReviewed
-            )
-
-            Spacer(Modifier.height(10.dp))
-            Text(
-                text = "Approve or reject is recorded against the SLMC verification step, not from this sheet.",
-                fontSize = 11.sp,
-                color = SlateLight,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-    }
-}
-
-@Composable
-private fun SheetSectionLabel(text: String) {
-    Text(
-        text = text.uppercase(),
-        fontSize = 11.sp,
-        letterSpacing = 0.8.sp,
-        fontWeight = FontWeight.SemiBold,
-        color = SlateLight,
-        modifier = Modifier.padding(bottom = 8.dp)
-    )
-}
-
-@Composable
-private fun DetailRow(label: String, value: String, valueColor: Color = DarkSlate) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = label,
-            fontSize = 13.sp,
-            color = SlateMedium,
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(Modifier.width(12.dp))
-        Text(
-            text = value,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = valueColor,
-            textAlign = TextAlign.End
-        )
-    }
-}
-
-@Composable
-private fun DocumentRow(name: String) {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .semantics { contentDescription = "$name, received" },
-        shape = RoundedCornerShape(12.dp),
-        color = LightBackground,
-        border = BorderStroke(1.dp, BorderColor)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Description,
-                contentDescription = null,
-                tint = SlateMedium,
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(Modifier.width(10.dp))
-            Text(
-                text = name,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = DarkSlate,
-                modifier = Modifier.weight(1f),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
+            Icon(Icons.Rounded.Person, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
-            Icon(
-                imageVector = Icons.Rounded.CheckCircle,
-                contentDescription = null,
-                tint = SuccessGreen,
-                modifier = Modifier.size(18.dp)
+            Text(
+                text = "Manage Users",
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold
             )
         }
     }
@@ -1107,157 +1012,562 @@ private fun AdminBottomBar(selectedTab: AdminTab, onTabSelected: (AdminTab) -> U
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Profile (holds Logout) + not-yet-built tabs
+// Profile — the signed-in admin's own `users` document
 // ─────────────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AdminProfilePane(onLogout: () -> Unit) {
+private fun AdminProfilePane(
+    profile: UserProfile?,
+    pharmacyCount: Int?,
+    medicineCount: Int?,
+    userCount: Int?,
+    isSaving: Boolean,
+    onLogout: () -> Unit,
+    onManageUsers: () -> Unit = {},
+    onSave: (UserProfile) -> Unit
+) {
+    var showEditProfile by remember { mutableStateOf(false) }
+    var showLogoutDialog by remember { mutableStateOf(false) }
+
+    val adminName = profile?.name.orEmpty().ifBlank { "Administrator" }
+    val initials = adminName.split(" ").mapNotNull { it.firstOrNull() }.take(2).joinToString("")
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 16.dp)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            color = SurfaceWhite,
-            border = BorderStroke(1.dp, BorderColor)
+            shape = RoundedCornerShape(22.dp),
+            color = DarkSlate,
+            shadowElevation = 4.dp
         ) {
-            Row(
-                modifier = Modifier.padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(52.dp)
-                        .clip(CircleShape)
-                        .background(Brush.linearGradient(listOf(GradientStart, GradientEnd))),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "HG",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 18.sp
-                    )
-                }
-                Spacer(Modifier.width(14.dp))
-                Column {
-                    Text(
-                        text = "Dr. Hasini Gunawardena",
-                        style = MaterialTheme.typography.titleLarge.copy(
-                            color = DarkSlate,
-                            fontWeight = FontWeight.Bold
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(DarkSlate, ForestEmerald.copy(alpha = 0.85f))
                         )
                     )
-                    Text(
-                        text = "System Administrator · MediFlow National Console",
-                        fontSize = 12.5.sp,
-                        color = SlateMedium
-                    )
+                    .padding(20.dp)
+            ) {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(68.dp)
+                                .clip(CircleShape)
+                                .background(Color.White.copy(alpha = 0.2f))
+                                .border(2.dp, Color.White, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = initials.ifBlank { "A" },
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 22.sp
+                            )
+                        }
+
+                        Spacer(Modifier.width(16.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = adminName,
+                                style = MaterialTheme.typography.titleLarge.copy(
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = profile?.email?.takeIf { it.isNotBlank() } ?: "No email on record",
+                                fontSize = 12.5.sp,
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Surface(
+                                color = Color.White.copy(alpha = 0.18f),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = "Admin role · ${profile?.uid ?: "not signed in"}",
+                                    fontSize = 10.5.sp,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(18.dp))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f))
+                    Spacer(Modifier.height(14.dp))
+
+                    OutlinedButton(
+                        onClick = { showEditProfile = true },
+                        enabled = profile != null,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.4f)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                    ) {
+                        Icon(Icons.Rounded.Edit, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Edit Profile", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }
 
-        Spacer(Modifier.height(16.dp))
-
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            color = SurfaceWhite,
-            border = BorderStroke(1.dp, BorderColor)
-        ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                DetailRow(label = "Role", value = "System Admin")
-                DetailRow(label = "SLMC Reg", value = "ADM-0031")
-                DetailRow(label = "Scope", value = "National · all districts")
-            }
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            ProfileMetricTile(
+                label = "Pharmacies",
+                value = counted(pharmacyCount),
+                caption = "On the network",
+                icon = Icons.Rounded.LocalPharmacy,
+                color = ForestEmerald,
+                modifier = Modifier.weight(1f)
+            )
+            ProfileMetricTile(
+                label = "Medicines",
+                value = counted(medicineCount),
+                caption = "In catalog",
+                icon = Icons.Rounded.Medication,
+                color = HealthcareBlue,
+                modifier = Modifier.weight(1f)
+            )
+            ProfileMetricTile(
+                label = "Accounts",
+                value = counted(userCount),
+                caption = "In users",
+                icon = Icons.Rounded.Person,
+                color = AmberWarning,
+                modifier = Modifier.weight(1f)
+            )
         }
 
-        Spacer(Modifier.height(24.dp))
-        MediFlowPrimaryButton(
-            text = "Logout",
-            icon = Icons.AutoMirrored.Rounded.Logout,
-            contentDescription = "Log out of the administrator account",
-            onClick = onLogout
+        ProfileSectionCard(
+            title = "Administrator Record",
+            icon = Icons.Rounded.Badge
+        ) {
+            CredentialDetailRow(
+                icon = Icons.Rounded.Email,
+                label = "Sign-in Email",
+                value = profile?.email.orEmpty().ifBlank { "Not recorded" },
+                badge = "Auth"
+            )
+            HorizontalDivider(color = BorderColor.copy(alpha = 0.5f), modifier = Modifier.padding(vertical = 4.dp))
+            CredentialDetailRow(
+                icon = Icons.Rounded.Phone,
+                label = "Contact Number",
+                value = profile?.phone.orEmpty().ifBlank { "Not recorded" },
+                badge = "Editable"
+            )
+            HorizontalDivider(color = BorderColor.copy(alpha = 0.5f), modifier = Modifier.padding(vertical = 4.dp))
+            CredentialDetailRow(
+                icon = Icons.Rounded.Home,
+                label = "Duty Station",
+                value = profile?.address.orEmpty().ifBlank { "Not recorded" },
+                badge = "Editable"
+            )
+        }
+
+        ProfileSectionCard(
+            title = "Console Access",
+            icon = Icons.Rounded.Security
+        ) {
+            InteractiveProfileRow(
+                icon = Icons.Rounded.Person,
+                iconBg = ForestEmerald.copy(alpha = 0.12f),
+                iconTint = ForestEmerald,
+                title = "Manage Users",
+                subtitle = "Patients, pharmacists and admins in the users collection",
+                onClick = onManageUsers
+            )
+        }
+
+        Button(
+            onClick = { showLogoutDialog = true },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = ErrorRed.copy(alpha = 0.12f),
+                contentColor = ErrorRed
+            ),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp)
+        ) {
+            Icon(Icons.AutoMirrored.Rounded.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "Sign Out of Admin Console",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.5.sp
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+    }
+
+    val current = profile
+    if (showEditProfile && current != null) {
+        EditAdminProfileSheet(
+            profile = current,
+            isSaving = isSaving,
+            onDismiss = { showEditProfile = false },
+            onSave = { updated ->
+                onSave(updated)
+                showEditProfile = false
+            }
         )
+    }
+
+    if (showLogoutDialog) {
+        AlertDialog(
+            onDismissRequest = { showLogoutDialog = false },
+            title = { Text("Sign Out of Admin Console?") },
+            text = { Text("You will need the admin email address and its password to sign back in.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showLogoutDialog = false
+                        onLogout()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ErrorRed)
+                ) {
+                    Text("Sign Out", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutDialog = false }) {
+                    Text("Cancel", color = SlateMedium)
+                }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EditAdminProfileSheet(
+    profile: UserProfile,
+    isSaving: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (UserProfile) -> Unit
+) {
+    var name by remember(profile) { mutableStateOf(profile.name) }
+    var phone by remember(profile) { mutableStateOf(profile.phone) }
+    var address by remember(profile) { mutableStateOf(profile.address) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(
+                text = "Edit Administrator Profile",
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = DarkSlate
+                )
+            )
+
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("Full Name") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                leadingIcon = { Icon(Icons.Rounded.Person, null) }
+            )
+
+            OutlinedTextField(
+                value = phone,
+                onValueChange = { phone = it },
+                label = { Text("Phone Number") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                leadingIcon = { Icon(Icons.Rounded.Phone, null) }
+            )
+
+            OutlinedTextField(
+                value = address,
+                onValueChange = { address = it },
+                label = { Text("Duty Station / Office") },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                leadingIcon = { Icon(Icons.Rounded.Home, null) }
+            )
+
+            Text(
+                text = "The email address is the sign-in identity, so it stays as it is; the " +
+                    "three fields above are written to this admin's document in `users`.",
+                fontSize = 11.5.sp,
+                color = SlateMedium,
+                lineHeight = 16.sp
+            )
+
+            Button(
+                onClick = {
+                    onSave(
+                        profile.copy(
+                            name = name.trim(),
+                            phone = phone.trim(),
+                            address = address.trim()
+                        )
+                    )
+                },
+                enabled = !isSaving,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = ForestEmerald)
+            ) {
+                Icon(Icons.Rounded.Save, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (isSaving) "Saving…" else "Save Changes",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
+        }
     }
 }
 
 @Composable
-private fun AdminPharmaciesTabPane(
-    onRegisterPharmacy: () -> Unit,
-    onReviewApplication: (Int) -> Unit,
-    pending: List<PendingApplication>
+private fun ProfileMetricTile(
+    label: String,
+    value: String,
+    caption: String,
+    icon: ImageVector,
+    color: Color,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 14.dp)
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        color = SurfaceWhite,
+        border = BorderStroke(1.dp, BorderColor)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier.padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "Pharmacy Registry",
-                    style = MaterialTheme.typography.titleLarge.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = DarkSlate
-                    )
-                )
-                Text(
-                    text = "National network accreditation & management",
-                    fontSize = 12.sp,
-                    color = SlateMedium
-                )
-            }
-
-            Button(
-                onClick = onRegisterPharmacy,
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = ForestEmerald,
-                    contentColor = Color.White
-                )
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(color.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
             ) {
-                Icon(Icons.Rounded.Add, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Register", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Icon(icon, null, tint = color, modifier = Modifier.size(16.dp))
             }
-        }
 
-        Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(6.dp))
 
-        SectionHeader(
-            title = "Awaiting Verification (${pending.size})",
-            caption = "SLMC applications pending review"
-        )
+            Text(
+                text = value,
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+                color = DarkSlate
+            )
 
-        Spacer(Modifier.height(10.dp))
-
-        if (pending.isEmpty()) {
-            EmptyApprovalsState()
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                pending.forEach { application ->
-                    PendingApprovalCard(
-                        application = application,
-                        onReview = { onReviewApplication(application.id) }
-                    )
-                }
-            }
+            Text(
+                text = label,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = SlateMedium
+            )
         }
     }
 }
+
+@Composable
+private fun ProfileSectionCard(
+    title: String,
+    icon: ImageVector,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = SurfaceWhite,
+        border = BorderStroke(1.dp, BorderColor)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, null, tint = ForestEmerald, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = title,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = DarkSlate
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            content()
+        }
+    }
+}
+
+@Composable
+private fun CredentialDetailRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    badge: String
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = SlateMedium, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = label, fontSize = 11.5.sp, color = SlateMedium)
+            Text(text = value, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = DarkSlate)
+        }
+        Surface(
+            color = ForestEmerald.copy(alpha = 0.08f),
+            shape = RoundedCornerShape(6.dp)
+        ) {
+            Text(
+                text = badge,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = ForestEmerald,
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun InteractiveProfileRow(
+    icon: ImageVector,
+    iconBg: Color,
+    iconTint: Color,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .clip(CircleShape)
+                .background(iconBg),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, null, tint = iconTint, modifier = Modifier.size(20.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.5.sp,
+                color = DarkSlate
+            )
+            Text(
+                text = subtitle,
+                fontSize = 11.5.sp,
+                color = SlateMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Icon(
+            imageVector = Icons.Rounded.ChevronRight,
+            contentDescription = null,
+            tint = SlateMedium,
+            modifier = Modifier.size(20.dp)
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Medicines tab — the live `medicines` collection
+// ─────────────────────────────────────────────────────────────────────────────
+
+private val categoryIcons = listOf(
+    Icons.Rounded.Healing, Icons.Rounded.Biotech, Icons.Rounded.MonitorHeart,
+    Icons.Rounded.Bloodtype, Icons.Rounded.Air, Icons.Rounded.LocalDining,
+    Icons.Rounded.FavoriteBorder, Icons.Rounded.Spa, Icons.Rounded.Medication
+)
+
+private val categoryTints = listOf(
+    ForestEmerald, HealthcareBlue, Color(0xFF8B5CF6),
+    AmberWarning, MintGreen, Color(0xFFEC4899),
+    Color(0xFF06B6D4), ErrorRed, Color(0xFFF97316)
+)
+
+private const val CATEGORY_PREVIEW_LIMIT = 9
+
+private fun Medicine.toCatalogueRow(): RecentMedicine = RecentMedicine(
+    name = "$name $strength",
+    packSize = packSize,
+    form = form,
+    category = medicineCategory.ifBlank { therapeuticClass },
+    addedAt = if (dataStatus.equals("ADMIN-ENTERED", ignoreCase = true)) {
+        "Entered from this console"
+    } else {
+        "Seeded catalogue entry"
+    },
+    prescriptionRequired = requiresPrescription
+)
 
 @Composable
 private fun AdminMedicinesTabPane(
+    medicines: List<Medicine>?,
     onAddMedicine: () -> Unit
 ) {
+    val rows = medicines.orEmpty()
+    val prescriptionCount = rows.count { it.requiresPrescription }
+    val categories = rows
+        .groupBy { it.medicineCategory.ifBlank { "Uncategorised" } }
+        .entries
+        .sortedByDescending { it.value.size }
+    val enteredFromConsole = rows
+        .filter { it.dataStatus.equals("ADMIN-ENTERED", ignoreCase = true) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1277,7 +1587,8 @@ private fun AdminMedicinesTabPane(
                     )
                 )
                 Text(
-                    text = "NMRA standard essential drugs directory",
+                    text = if (medicines == null) "Reading the medicines collection…"
+                    else "$prescriptionCount need a prescription · ${rows.size - prescriptionCount} over the counter",
                     fontSize = 12.sp,
                     color = SlateMedium
                 )
@@ -1297,100 +1608,278 @@ private fun AdminMedicinesTabPane(
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(14.dp))
 
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = SurfaceWhite,
-            border = BorderStroke(1.dp, BorderColor),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(HealthcareBlue.copy(alpha = 0.12f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Rounded.Medication, null, tint = HealthcareBlue, modifier = Modifier.size(20.dp))
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            text = "Master Drug Dictionary (1,247 Entries)",
-                            fontSize = 14.5.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = DarkSlate
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MedicineKpiMini(
+                value = counted(rows.size.takeIf { medicines != null }),
+                label = "Total Drugs",
+                icon = Icons.Rounded.Medication,
+                tint = HealthcareBlue,
+                modifier = Modifier.weight(1f)
+            )
+            MedicineKpiMini(
+                value = (rows.size - prescriptionCount).toString(),
+                label = "OTC",
+                icon = Icons.Rounded.Storefront,
+                tint = ForestEmerald,
+                modifier = Modifier.weight(1f)
+            )
+            MedicineKpiMini(
+                value = prescriptionCount.toString(),
+                label = "POM",
+                icon = Icons.Rounded.Lock,
+                tint = AmberWarning,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+
+        SectionHeader(
+            title = "Categories",
+            caption = if (categories.isEmpty()) "No entries yet"
+            else "${categories.size} categories in use, by entry count"
+        )
+        Spacer(Modifier.height(10.dp))
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            categories.take(CATEGORY_PREVIEW_LIMIT).chunked(3).forEachIndexed { rowIndex, row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    row.forEachIndexed { colIndex, (name, entries) ->
+                        val colorIdx = rowIndex * 3 + colIndex
+                        CategoryChipCard(
+                            name = name,
+                            count = "${entries.size}",
+                            icon = categoryIcons[colorIdx % categoryIcons.size],
+                            tint = categoryTints.getOrElse(colorIdx) { HealthcareBlue },
+                            modifier = Modifier.weight(1f)
                         )
-                        Text(
-                            text = "Synchronized across 142 registered pharmacies",
-                            fontSize = 12.sp,
-                            color = SlateMedium
-                        )
                     }
-                }
-
-                Spacer(Modifier.height(14.dp))
-
-                Button(
-                    onClick = onAddMedicine,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = HealthcareBlue,
-                        contentColor = Color.White
-                    )
-                ) {
-                    Icon(Icons.Rounded.AddCircleOutline, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Add New Medicine to NMRA Master", fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                    repeat(3 - row.size) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
                 }
             }
+        }
+
+        Spacer(Modifier.height(18.dp))
+
+        SectionHeader(
+            title = "Entered From This Console",
+            caption = "Drugs the admin added; the rest came from the seed"
+        )
+        Spacer(Modifier.height(10.dp))
+
+        if (enteredFromConsole.isEmpty()) {
+            Text(
+                text = "Nothing yet. Use “Add Drug” and the new entry appears here and in every " +
+                    "branch's stock picker.",
+                fontSize = 12.5.sp,
+                color = SlateMedium,
+                lineHeight = 17.sp
+            )
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                enteredFromConsole.take(6).forEach { medicine ->
+                    RecentMedicineCard(medicine = medicine.toCatalogueRow())
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = HealthcareBlue.copy(alpha = 0.07f),
+            border = BorderStroke(1.dp, HealthcareBlue.copy(alpha = 0.2f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Info, null, tint = HealthcareBlue, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = "Duplicate prevention: the console compares brand name and strength " +
+                        "against the medicines collection before writing.",
+                    fontSize = 11.5.sp,
+                    color = DarkSlate,
+                    lineHeight = 16.sp,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+private data class RecentMedicine(
+    val name: String,
+    val packSize: String,
+    val form: String,
+    val category: String,
+    val addedAt: String,
+    val prescriptionRequired: Boolean
+)
+
+@Composable
+private fun MedicineKpiMini(
+    value: String,
+    label: String,
+    icon: ImageVector,
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(14.dp),
+        color = SurfaceWhite,
+        border = BorderStroke(1.dp, BorderColor)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(tint.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(icon, null, tint = tint, modifier = Modifier.size(16.dp))
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = value,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = tint
+            )
+            Text(
+                text = label,
+                fontSize = 10.5.sp,
+                color = SlateMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
 
 @Composable
-private fun PendingAdminTab(tab: AdminTab) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(start = 24.dp, end = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+private fun CategoryChipCard(
+    name: String,
+    count: String,
+    icon: ImageVector,
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        color = tint.copy(alpha = 0.08f),
+        border = BorderStroke(1.dp, tint.copy(alpha = 0.2f))
     ) {
-        Box(
-            modifier = Modifier
-                .size(72.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color(0xFFF1F5F9)),
-            contentAlignment = Alignment.Center
+        Column(
+            modifier = Modifier.padding(10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Icon(
-                imageVector = tab.icon,
-                contentDescription = null,
-                tint = SlateMedium,
-                modifier = Modifier.size(34.dp)
+            Icon(icon, null, tint = tint, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = count,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = tint
             )
-        }
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = tab.label,
-            style = MaterialTheme.typography.headlineSmall.copy(
+            Text(
+                text = name.split(" ").first(),
+                fontSize = 9.5.sp,
                 color = DarkSlate,
-                fontWeight = FontWeight.Bold
-            )
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "This screen is next in the admin build.",
-            style = MaterialTheme.typography.bodyMedium.copy(
-                color = SlateMedium,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center
             )
-        )
+        }
+    }
+}
+
+@Composable
+private fun RecentMedicineCard(medicine: RecentMedicine) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = SurfaceWhite,
+        border = BorderStroke(1.dp, BorderColor)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(HealthcareBlue.copy(alpha = 0.10f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Medication,
+                    contentDescription = null,
+                    tint = HealthcareBlue,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = medicine.name,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = DarkSlate,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (medicine.prescriptionRequired) {
+                        Spacer(Modifier.width(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AmberWarning.copy(alpha = 0.14f)
+                        ) {
+                            Text(
+                                text = "POM",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AmberWarning,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = listOf(medicine.packSize, medicine.form, medicine.category)
+                        .filter { it.isNotBlank() }.joinToString(" · "),
+                    fontSize = 11.5.sp,
+                    color = SlateMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = medicine.addedAt,
+                    fontSize = 10.5.sp,
+                    color = SlateLight
+                )
+            }
+        }
     }
 }
 
@@ -1406,5 +1895,17 @@ private fun relativeSyncTime(syncedAt: Long, now: Long): String {
         seconds < 3600 -> "${seconds / 60} minutes ago"
         seconds < 7200 -> "1 hour ago"
         else -> "${seconds / 3600} hours ago"
+    }
+}
+
+/** How long a hold has been open, in the same plain words the rest of the console uses. */
+private fun holdTime(placedAtMillis: Long, now: Long): String {
+    if (placedAtMillis <= 0L) return "no timestamp"
+    val minutes = ((now - placedAtMillis) / 60_000).coerceAtLeast(0)
+    return when {
+        minutes < 1 -> "placed just now"
+        minutes < 60 -> "placed ${minutes} min ago"
+        minutes < 24 * 60 -> "placed ${minutes / 60} h ago"
+        else -> "placed ${minutes / (60 * 24)} d ago"
     }
 }
