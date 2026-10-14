@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Captured prescription slips are written to the app cache and shared with the
+         camera app only for the duration of the shot. -->
+    <cache-path name="slips" path="." />
+</paths>

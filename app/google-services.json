@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "827995825214",
+    "project_id": "mediflow-d4ccc",
+    "storage_bucket": "mediflow-d4ccc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:827995825214:android:dd88751752532694c81d6f",
+        "android_client_info": {
+          "package_name": "com.mediflow.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyACHT2--KMGtEMkGYbquBQe-39bLPO9XX8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

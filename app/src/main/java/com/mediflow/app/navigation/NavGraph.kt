@@ -1,6 +1,11 @@
 package com.mediflow.app.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -10,7 +15,11 @@ import com.mediflow.app.ui.screens.AdminAddMedicineScreen
 import com.mediflow.app.ui.screens.AdminDashboardScreen
 import com.mediflow.app.ui.screens.AdminRegisterPharmacyScreen
 import com.mediflow.app.ui.screens.AreaDropdownScreen
+import com.mediflow.app.BuildConfig
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.model.UserRole
 import com.mediflow.app.ui.screens.CounterQrScreen
+import com.mediflow.app.ui.screens.DebugSeederScreen
 import com.mediflow.app.ui.screens.ForgotPasswordScreen
 import com.mediflow.app.ui.screens.LoginScreen
 import com.mediflow.app.ui.screens.PatientDashboardScreen
@@ -27,7 +36,8 @@ import com.mediflow.app.ui.screens.WelcomeScreen
  * Route flow:
  *  Welcome (2.5s auto) → Login ← → ForgotPassword → Dashboard
  *      Dashboard → PhotoCapture → SmartSearch(attached) → ReservationReview
- *      Dashboard → SmartSearch(not attached) → ReservationReview
+ *      Dashboard(Search tab) → ReservationReview → AreaDropdown → StockResults
+ *      ReservationReview → PhotoCapture(returnTo=review) → back to the same cart
  *      ReservationReview → AreaDropdown → StockResults → confirmation sheet
  *      StockResults / Dashboard(Vault) → CounterQr
  *
@@ -39,13 +49,31 @@ import com.mediflow.app.ui.screens.WelcomeScreen
  */
 @Composable
 fun MediFlowNavGraph(navController: NavHostController) {
+    // Firebase keeps the signed-in user across process death; the profile and
+    // therefore the landing screen is re-read from Firestore while the splash runs.
+    var resumeRoute by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        val uid = AppGraph.auth.currentUid
+        val profile = uid?.let { AppGraph.auth.readProfile(it) }
+        if (profile != null && profile.status == "active") {
+            AppGraph.rememberProfile(profile)
+            resumeRoute = when (profile.role) {
+                UserRole.PATIENT -> Screen.Dashboard.route
+                UserRole.PHARMACIST -> Screen.PharmacistStock.route
+                UserRole.ADMIN -> Screen.AdminConsole.route
+            }
+        } else if (uid != null) {
+            AppGraph.signOut()
+        }
+    }
+
     NavHost(
         navController = navController,
         startDestination = Screen.Welcome.route
     ) {
         // ── Screen 1: Welcome / Splash ────────────────────────────────────
         composable(Screen.Welcome.route) {
-            WelcomeScreen(navController = navController)
+            WelcomeScreen(navController = navController, resumeTo = resumeRoute)
         }
 
         // ── Screen 2: Login / Sign Up (Tabbed) ───────────────────────────
@@ -68,8 +96,16 @@ fun MediFlowNavGraph(navController: NavHostController) {
                 },
                 onForgotPassword = {
                     navController.navigate(Screen.ForgotPassword.route)
-                }
+                },
+                onOpenSeeder = { navController.navigate(Screen.DebugSeeder.route) }
             )
+        }
+
+        // ── Debug-only: Firestore seeder ──────────────────────────────────
+        if (BuildConfig.DEBUG) {
+            composable(Screen.DebugSeeder.route) {
+                DebugSeederScreen(onBack = { navController.popBackStack() })
+            }
         }
 
         // ── Screen 3: Forgot Password / OTP / Reset ───────────────────────
@@ -88,13 +124,16 @@ fun MediFlowNavGraph(navController: NavHostController) {
         composable(Screen.Dashboard.route) {
             PatientDashboardScreen(
                 onLogout = {
+                    AppGraph.signOut()
                     navController.navigate(Screen.Login.route) {
                         popUpTo(Screen.Dashboard.route) { inclusive = true }
                     }
                 },
-                onUploadSlip = { navController.navigate(Screen.PhotoCapture.route) },
-                onDirectSearch = {
-                    navController.navigate(Screen.SmartSearch.routeFor(attached = false))
+                onUploadSlip = { navController.navigate(Screen.PhotoCapture.routeFor()) },
+                onSearchProceed = { label, variant ->
+                    navController.navigate(
+                        Screen.ReservationReview.routeFor(label = label, variant = variant)
+                    )
                 },
                 onShowCounterQr = { reference, label, pharmacy ->
                     navController.navigate(
@@ -105,37 +144,38 @@ fun MediFlowNavGraph(navController: NavHostController) {
         }
 
         // ── Screen 5: Prescription Slip Capture ────────────────────────────
-        composable(Screen.PhotoCapture.route) {
+        composable(
+            route = Screen.PhotoCapture.route,
+            arguments = listOf(
+                navArgument(Screen.PhotoCapture.ARG_RETURN_TO) {
+                    type = NavType.StringType
+                    defaultValue = ""
+                }
+            )
+        ) { entry ->
+            val returnTo = entry.arguments?.getString(Screen.PhotoCapture.ARG_RETURN_TO).orEmpty()
             PhotoCaptureScreen(
                 onBack = { navController.popBackStack() },
                 onCaptured = {
-                    navController.navigate(Screen.SmartSearch.routeFor(attached = true))
+                    // The upload wrote its path straight into CartStore, so both exits only
+                    // need to move; the screen the patient came from reads the cart back.
+                    if (returnTo == Screen.PhotoCapture.RETURN_REVIEW) {
+                        navController.popBackStack()
+                    } else {
+                        navController.navigate(Screen.SmartSearch.route)
+                    }
                 }
             )
         }
 
         // ── Screen 6: Smart Medicine Search ────────────────────────────────
-        composable(
-            route = Screen.SmartSearch.route,
-            arguments = listOf(
-                navArgument(Screen.SmartSearch.ARG_ATTACHED) {
-                    type = NavType.BoolType
-                    defaultValue = false
-                }
-            )
-        ) { entry ->
-            val attached = entry.arguments?.getBoolean(Screen.SmartSearch.ARG_ATTACHED) ?: false
+        composable(Screen.SmartSearch.route) {
             SmartSearchScreen(
-                prescriptionAttached = attached,
                 onBack = { navController.popBackStack() },
-                onChangePhoto = { navController.navigate(Screen.PhotoCapture.route) },
+                onChangePhoto = { navController.navigate(Screen.PhotoCapture.routeFor()) },
                 onProceed = { label, variant ->
                     navController.navigate(
-                        Screen.ReservationReview.routeFor(
-                            attached = attached,
-                            label = label,
-                            variant = variant
-                        )
+                        Screen.ReservationReview.routeFor(label = label, variant = variant)
                     )
                 }
             )
@@ -145,10 +185,6 @@ fun MediFlowNavGraph(navController: NavHostController) {
         composable(
             route = Screen.ReservationReview.route,
             arguments = listOf(
-                navArgument(Screen.ReservationReview.ARG_ATTACHED) {
-                    type = NavType.BoolType
-                    defaultValue = false
-                },
                 navArgument(Screen.ReservationReview.ARG_LABEL) {
                     type = NavType.StringType
                     defaultValue = ""
@@ -161,12 +197,16 @@ fun MediFlowNavGraph(navController: NavHostController) {
         ) { entry ->
             val args = entry.arguments
             ReservationReviewScreen(
-                prescriptionAttached = args?.getBoolean(Screen.ReservationReview.ARG_ATTACHED) ?: false,
                 incomingLabel = args?.getString(Screen.ReservationReview.ARG_LABEL),
                 incomingVariant = args?.getString(Screen.ReservationReview.ARG_VARIANT),
                 onBack = { navController.popBackStack() },
                 onPickPharmacy = { summaryLabel ->
                     navController.navigate(Screen.AreaDropdown.routeFor(summaryLabel))
+                },
+                onAddSlip = {
+                    navController.navigate(
+                        Screen.PhotoCapture.routeFor(Screen.PhotoCapture.RETURN_REVIEW)
+                    )
                 }
             )
         }
@@ -248,6 +288,7 @@ fun MediFlowNavGraph(navController: NavHostController) {
         composable(Screen.PharmacistStock.route) {
             PharmacistStockScreen(
                 onLogout = {
+                    AppGraph.signOut()
                     navController.navigate(Screen.Login.route) {
                         popUpTo(Screen.PharmacistStock.route) { inclusive = true }
                     }
@@ -259,6 +300,7 @@ fun MediFlowNavGraph(navController: NavHostController) {
         composable(Screen.AdminConsole.route) {
             AdminDashboardScreen(
                 onLogout = {
+                    AppGraph.signOut()
                     navController.navigate(Screen.Login.route) {
                         popUpTo(Screen.AdminConsole.route) { inclusive = true }
                     }
@@ -287,5 +329,6 @@ fun MediFlowNavGraph(navController: NavHostController) {
                 onMedicineAdded = { navController.popBackStack() }
             )
         }
+
     }
 }

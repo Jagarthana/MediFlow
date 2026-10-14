@@ -29,8 +29,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.model.ReservationStatus
 import com.mediflow.app.ui.theme.*
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Screen 11 — Request Vault / Order History (Variant B / Figma 8)
@@ -45,8 +52,8 @@ import kotlinx.coroutines.delay
  * content — a nested LazyColumn inside a vertically scrolled parent throws at
  * layout time.
  *
- * [sampleReservations] is UI-phase data; the history, expiry and per-medicine
- * fill state come from the backend.
+ * Rows come from the signed-in patient's reservations, grouped by their
+ * display status (an overdue RESERVED hold reads as Expired).
  *
  * WCAG 2.1 AA: badges never rely on colour alone (icon + words), tabs and cards
  * are 44dp+ targets, and every control carries a semantic label.
@@ -66,59 +73,67 @@ private enum class VaultFilter(val label: String, val status: VaultStatus?) {
 }
 
 private data class Reservation(
+    val reservationId: String,
     val reference: String,
     val pharmacyName: String,
     val area: String,
     val dateLabel: String,
     val medicines: List<String>,
     val status: VaultStatus,
-    val expiresLabel: String? = null
+    val expiresLabel: String? = null,
+    /** Only a hold the branch has not yet staged can be cancelled by the patient. */
+    val cancelable: Boolean = false,
+    /** Why the row is not live any more — the pharmacist's reason, or the patient's own. */
+    val note: String? = null
 )
 
-private val sampleReservations = listOf(
-    Reservation(
-        reference = "4821",
-        pharmacyName = "City Pharmacy Negombo",
-        area = "Negombo",
-        dateLabel = "Today · 05 Oct",
-        medicines = listOf("Paracetamol 500mg", "Amoxicillin 250mg"),
-        status = VaultStatus.ACTIVE,
-        expiresLabel = "Expires 6:00 PM today"
-    ),
-    Reservation(
-        reference = "4712",
-        pharmacyName = "Serendib Pharmacy",
-        area = "Kurunegala",
-        dateLabel = "Tue · 30 Sep",
-        medicines = listOf("Metformin 500mg"),
-        status = VaultStatus.ACTIVE,
-        expiresLabel = "Expires in 4 hours"
-    ),
-    Reservation(
-        reference = "4498",
-        pharmacyName = "HealthMart Wattala",
-        area = "Wattala",
-        dateLabel = "Fri · 26 Sep",
-        medicines = listOf("Amlodipine 5mg", "Atorvastatin 10mg", "Vitamin D3 60k IU"),
-        status = VaultStatus.COMPLETED
-    ),
-    Reservation(
-        reference = "4310",
-        pharmacyName = "Sevana Pharmacy Kimseriya",
-        area = "Negombo",
-        dateLabel = "Mon · 22 Sep",
-        medicines = listOf("Cetirizine 10mg"),
-        status = VaultStatus.EXPIRED
-    ),
-    Reservation(
-        reference = "4155",
-        pharmacyName = "Crown Chemists",
-        area = "Nikitasthena",
-        dateLabel = "Thu · 18 Sep",
-        medicines = listOf("Losartan 50mg", "Bisoprolol 2.5mg", "Aspirin 75mg", "Omeprazole 20mg"),
-        status = VaultStatus.COMPLETED
+private fun com.mediflow.app.data.model.Reservation.toVaultReservation(): Reservation {
+    val shown = displayStatus()
+    val status = when (shown) {
+        ReservationStatus.RESERVED, ReservationStatus.READY -> VaultStatus.ACTIVE
+        ReservationStatus.COLLECTED -> VaultStatus.COMPLETED
+        ReservationStatus.EXPIRED, ReservationStatus.CANCELLED -> VaultStatus.EXPIRED
+    }
+    val expiresLabel = if (status == VaultStatus.ACTIVE) {
+        "Expires " + SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
+            .format(Date(expiresAtMillis))
+    } else null
+
+    return Reservation(
+        reservationId = reservationId,
+        reference = reference,
+        pharmacyName = pharmacyName,
+        area = areaLabel,
+        dateLabel = createdAtLabel(createdAtMillis),
+        medicines = medicineLabels,
+        status = status,
+        expiresLabel = expiresLabel,
+        cancelable = shown == ReservationStatus.RESERVED,
+        note = when {
+            shown == ReservationStatus.CANCELLED ->
+                cancelReason?.takeIf { it.isNotBlank() } ?: "Cancelled"
+            shown == ReservationStatus.EXPIRED -> "The hold lapsed after 24 hours"
+            shown == ReservationStatus.READY -> "Collected at the counter"
+            else -> null
+        }
     )
-)
+}
+
+private fun createdAtLabel(createdAtMillis: Long): String {
+    val date = SimpleDateFormat("dd MMM", Locale.getDefault()).format(Date(createdAtMillis))
+    return if (isToday(createdAtMillis)) {
+        "Today · $date"
+    } else {
+        SimpleDateFormat("EEE", Locale.getDefault()).format(Date(createdAtMillis)) + " · $date"
+    }
+}
+
+private fun isToday(millis: Long): Boolean {
+    val then = Calendar.getInstance().apply { timeInMillis = millis }
+    val now = Calendar.getInstance()
+    return then.get(Calendar.YEAR) == now.get(Calendar.YEAR) &&
+        then.get(Calendar.DAY_OF_YEAR) == now.get(Calendar.DAY_OF_YEAR)
+}
 
 @Composable
 fun ReservationVaultTabContent(
@@ -128,9 +143,23 @@ fun ReservationVaultTabContent(
     var filter by remember { mutableStateOf(VaultFilter.ALL) }
     var searchOpen by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var revision by remember { mutableIntStateOf(0) }
+    var cancelling by remember { mutableStateOf<Reservation?>(null) }
+    var cancelFailed by remember { mutableStateOf<String?>(null) }
+
+    val scope = rememberCoroutineScope()
+    val uid = AppGraph.currentProfile?.uid
+    val reservations by produceState(initialValue = emptyList<Reservation>(), key1 = uid, key2 = revision) {
+        value = if (uid == null) {
+            emptyList()
+        } else {
+            runCatching { AppGraph.reservations.forPatient(uid) }.getOrNull().orEmpty()
+                .map { it.toVaultReservation() }
+        }
+    }
 
     val trimmed = query.trim()
-    val matching = sampleReservations.filter { reservation ->
+    val matching = reservations.filter { reservation ->
         (filter.status == null || reservation.status == filter.status) &&
             (trimmed.isEmpty() ||
                 reservation.pharmacyName.contains(trimmed, ignoreCase = true) ||
@@ -169,13 +198,76 @@ fun ReservationVaultTabContent(
                             reservation.medicines.firstOrNull().orEmpty(),
                             reservation.pharmacyName
                         )
-                    }
+                    },
+                    onCancel = { cancelling = reservation }
                 )
                 Spacer(Modifier.height(12.dp))
             }
         }
 
         Spacer(Modifier.height(24.dp))
+    }
+
+    val target = cancelling
+    if (target != null) {
+        AlertDialog(
+            onDismissRequest = { cancelling = null },
+            icon = {
+                Icon(
+                    imageVector = Icons.Rounded.Cancel,
+                    contentDescription = null,
+                    tint = ErrorRed,
+                    modifier = Modifier.size(26.dp)
+                )
+            },
+            title = { Text("Release this hold?", fontWeight = FontWeight.Bold, color = DarkSlate) },
+            text = {
+                Text(
+                    text = "${target.medicines.joinToString().ifBlank { "This reservation" }} at " +
+                        "${target.pharmacyName} is put back for other patients. " +
+                        "Reference ${target.reference} stops working at the counter.",
+                    color = SlateMedium,
+                    fontSize = 13.5.sp
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val picked = target
+                        cancelling = null
+                        scope.launch {
+                            AppGraph.reservations
+                                .cancel(picked.reservationId, "Cancelled by the patient")
+                                .onSuccess { revision += 1 }
+                                .onFailure { cancelFailed = it.message ?: "Couldn't release the hold." }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
+                    shape = RoundedCornerShape(10.dp)
+                ) { Text("Release hold", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { cancelling = null }) { Text("Keep it", color = SlateMedium) }
+            },
+            containerColor = SurfaceWhite,
+            shape = RoundedCornerShape(18.dp)
+        )
+    }
+
+    val failure = cancelFailed
+    if (failure != null) {
+        AlertDialog(
+            onDismissRequest = { cancelFailed = null },
+            confirmButton = {
+                TextButton(
+                    onClick = { cancelFailed = null },
+                    colors = ButtonDefaults.textButtonColors(contentColor = ForestEmerald)
+                ) { Text("OK", fontWeight = FontWeight.Bold) }
+            },
+            title = { Text("Hold still open", fontWeight = FontWeight.Bold, color = DarkSlate) },
+            text = { Text(failure, color = SlateMedium, fontSize = 13.5.sp) },
+            containerColor = SurfaceWhite
+        )
     }
 }
 
@@ -313,7 +405,11 @@ private fun StatusTab(label: String, selected: Boolean, onClick: () -> Unit) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun ReservationCard(reservation: Reservation, onShowQr: () -> Unit) {
+private fun ReservationCard(
+    reservation: Reservation,
+    onShowQr: () -> Unit,
+    onCancel: () -> Unit
+) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -412,6 +508,45 @@ private fun ReservationCard(reservation: Reservation, onShowQr: () -> Unit) {
                         fontWeight = FontWeight.SemiBold
                     )
                 }
+
+                if (reservation.cancelable) {
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(
+                        onClick = onCancel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 44.dp)
+                            .semantics {
+                                contentDescription =
+                                    "Release the hold at ${reservation.pharmacyName}, reference ${reservation.reference}"
+                            }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Cancel,
+                            contentDescription = null,
+                            tint = ErrorRed,
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Release this hold",
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = ErrorRed
+                        )
+                    }
+                }
+            }
+
+            val note = reservation.note
+            if (note != null) {
+                Spacer(Modifier.height(9.dp))
+                Text(
+                    text = note,
+                    fontSize = 12.sp,
+                    color = SlateMedium,
+                    modifier = Modifier.semantics { contentDescription = "Status detail: $note" }
+                )
             }
         }
     }

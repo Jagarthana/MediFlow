@@ -33,8 +33,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.model.Medicine
 import com.mediflow.app.ui.theme.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -129,14 +130,15 @@ fun AdminAddMedicineScreen(
     val focusManager = LocalFocusManager.current
 
     // Form fields state
-    var genericName by rememberSaveable { mutableStateOf("Paracetamol") }
-    var brandName by rememberSaveable { mutableStateOf("Panadol") }
-    var dosageAmount by rememberSaveable { mutableStateOf("500") }
+    var genericName by rememberSaveable { mutableStateOf("") }
+    var brandName by rememberSaveable { mutableStateOf("") }
+    var dosageAmount by rememberSaveable { mutableStateOf("") }
     var dosageUnit by rememberSaveable { mutableStateOf("mg") }
     var selectedDosageForm by rememberSaveable { mutableStateOf("Tablet") }
-    var manufacturer by rememberSaveable { mutableStateOf("GlaxoSmithKline (GSK) Ceylon Ltd") }
-    var nmraApprovalNumber by rememberSaveable { mutableStateOf("NMRA/REG/2024/0892") }
-    var selectedCategory by rememberSaveable { mutableStateOf("Analgesic & Antipyretic") }
+    var manufacturer by rememberSaveable { mutableStateOf("") }
+    var nmraApprovalNumber by rememberSaveable { mutableStateOf("") }
+    var packSize by rememberSaveable { mutableStateOf("") }
+    var selectedCategory by rememberSaveable { mutableStateOf(drugCategories.first()) }
     var isPrescriptionRequired by rememberSaveable { mutableStateOf(false) }
 
     // Dropdown expansions
@@ -148,8 +150,10 @@ fun AdminAddMedicineScreen(
     // Submission & Duplicate Checking states
     var isSubmitting by remember { mutableStateOf(false) }
     var showSuccessDialog by remember { mutableStateOf(false) }
+    var savedMedicine by remember { mutableStateOf<Medicine?>(null) }
 
-    val fullDosage = "$dosageAmount$dosageUnit"
+    /** Matched to the catalogue's own shape: `500 mg`, not `500mg`. */
+    val fullDosage = "$dosageAmount $dosageUnit".trim()
 
     // Validation
     fun validateForm(): Boolean {
@@ -178,9 +182,46 @@ fun AdminAddMedicineScreen(
 
         scope.launch {
             isSubmitting = true
-            delay(1100) // Simulate NMRA database duplicate check & catalog insert
+            val duplicate = AppGraph.admin.findMedicine(brandName.trim(), fullDosage)
+            if (duplicate != null) {
+                isSubmitting = false
+                snackbarHostState.showSnackbar(
+                    "${duplicate.name} ${duplicate.strength} is already in the catalogue as ${duplicate.medicineId}."
+                )
+                return@launch
+            }
+
+            val outcome = AppGraph.admin.registerMedicine(
+                Medicine(
+                    medicineId = "",
+                    name = brandName.trim(),
+                    genericName = genericName.trim(),
+                    form = selectedDosageForm,
+                    strength = fullDosage,
+                    packSize = packSize.trim(),
+                    medicineCategory = selectedCategory,
+                    therapeuticClass = genericName.trim(),
+                    essentialMedicineLevel = "",
+                    requiresPrescription = isPrescriptionRequired,
+                    searchTerms = listOf(brandName.trim(), genericName.trim(), selectedDosageForm, fullDosage)
+                        .map { it.lowercase() }
+                        .distinct(),
+                    dataStatus = "ADMIN-ENTERED",
+                    manufacturer = manufacturer.trim(),
+                    nmraApprovalNumber = nmraApprovalNumber.trim()
+                )
+            )
             isSubmitting = false
-            showSuccessDialog = true
+            outcome
+                .onSuccess {
+                    savedMedicine = it
+                    showSuccessDialog = true
+                }
+                .onFailure {
+                    snackbarHostState.showSnackbar(
+                        it.message ?: "The catalogue could not be written. Check the connection."
+                    )
+                }
         }
     }
 
@@ -458,6 +499,21 @@ fun AdminAddMedicineScreen(
 
             Spacer(Modifier.height(16.dp))
 
+            // Pack Size
+            FormLabel(label = "Pack Size")
+            OutlinedTextField(
+                value = packSize,
+                onValueChange = { packSize = it },
+                placeholder = { Text("e.g. 10 tablets", color = SlateLight, fontSize = 14.sp) },
+                leadingIcon = { Icon(Icons.Rounded.Inventory2, null, tint = HealthcareBlue) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = formTextFieldColors()
+            )
+
+            Spacer(Modifier.height(16.dp))
+
             // Therapeutic Category Dropdown
             FormLabel(label = "Therapeutic Category *")
             ExposedDropdownMenuBox(
@@ -570,13 +626,10 @@ fun AdminAddMedicineScreen(
         }
     }
 
-    if (showSuccessDialog) {
+    val created = savedMedicine
+    if (showSuccessDialog && created != null) {
         AddMedicineSuccessDialog(
-            brandName = brandName,
-            genericName = genericName,
-            dosage = fullDosage,
-            form = selectedDosageForm,
-            approvalNumber = nmraApprovalNumber,
+            medicine = created,
             onDismiss = {
                 showSuccessDialog = false
                 onMedicineAdded()
@@ -820,11 +873,7 @@ private fun AdminAddMedicineBottomBar(
 
 @Composable
 private fun AddMedicineSuccessDialog(
-    brandName: String,
-    genericName: String,
-    dosage: String,
-    form: String,
-    approvalNumber: String,
+    medicine: Medicine,
     onDismiss: () -> Unit
 ) {
     Dialog(
@@ -870,7 +919,7 @@ private fun AddMedicineSuccessDialog(
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    text = "$brandName ($genericName $dosage $form) has been registered under $approvalNumber in the National Drug Dictionary.",
+                    text = "${medicine.name} (${medicine.genericName}, ${medicine.strength} ${medicine.form}) has been added to the National Drug Dictionary.",
                     fontSize = 13.sp,
                     color = SlateMedium,
                     textAlign = TextAlign.Center,
@@ -885,18 +934,30 @@ private fun AddMedicineSuccessDialog(
                     color = LightBackground,
                     border = BorderStroke(1.dp, BorderColor)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Rounded.Sync, null, tint = SuccessGreen, modifier = Modifier.size(20.dp))
-                        Spacer(Modifier.width(10.dp))
-                        Text(
-                            text = "Catalog Synced · Available for pharmacy inventory mapping",
-                            fontSize = 11.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = DarkSlate
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        CatalogFactRow("Catalogue id", medicine.medicineId)
+                        CatalogFactRow("NMRA approval", medicine.nmraApprovalNumber)
+                        CatalogFactRow(
+                            "Prescription",
+                            if (medicine.requiresPrescription) "Required" else "Not required"
                         )
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Rounded.Sync,
+                                null,
+                                tint = SuccessGreen,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "Saved in the medicines collection. A branch adds it to its own shelf from the pharmacist console.",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = DarkSlate,
+                                lineHeight = 16.sp
+                            )
+                        }
                     }
                 }
 
@@ -937,6 +998,29 @@ private fun FormLabel(label: String) {
         color = DarkSlate,
         modifier = Modifier.padding(bottom = 6.dp, start = 2.dp)
     )
+}
+
+@Composable
+private fun CatalogFactRow(label: String, value: String) {
+    if (value.isBlank()) return
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label, fontSize = 11.5.sp, color = SlateLight, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = value,
+            fontSize = 11.5.sp,
+            color = DarkSlate,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.End,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false)
+        )
+    }
+    Spacer(Modifier.height(6.dp))
 }
 
 @Composable

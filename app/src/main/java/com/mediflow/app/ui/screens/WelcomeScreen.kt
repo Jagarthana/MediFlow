@@ -50,9 +50,13 @@ import kotlinx.coroutines.launch
  * WCAG 2.1 AA: White text on gradient background (4.5:1+ contrast ratio)
  */
 @Composable
-fun WelcomeScreen(navController: NavController) {
+fun WelcomeScreen(
+    navController: NavController,
+    resumeTo: String? = null
+) {
 
     // ── Animation state ───────────────────────────────────────────────────────
+    val resumedTo by rememberUpdatedState(resumeTo)
     val logoAlpha    = remember { Animatable(0f) }
     val logoScale    = remember { Animatable(0.7f) }
     val textAlpha    = remember { Animatable(0f) }
@@ -88,9 +92,10 @@ fun WelcomeScreen(navController: NavController) {
             animationSpec = tween(durationMillis = 600, easing = FastOutSlowInEasing)
         )
 
-        // Navigate after full 2500ms delay
+        // Navigate after full 2500ms delay. The splash keeps animating while a
+        // stored session is looked up, so read the latest value at jump time.
         delay(1100)
-        navController.navigate(Screen.Login.route) {
+        navController.navigate(resumedTo ?: Screen.Login.route) {
             popUpTo(Screen.Welcome.route) { inclusive = true }
         }
     }

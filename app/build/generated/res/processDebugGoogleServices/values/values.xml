@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="gcm_defaultSenderId" translatable="false">827995825214</string>
+    <string name="google_api_key" translatable="false">AIzaSyACHT2--KMGtEMkGYbquBQe-39bLPO9XX8</string>
+    <string name="google_app_id" translatable="false">1:827995825214:android:dd88751752532694c81d6f</string>
+    <string name="google_crash_reporting_api_key" translatable="false">AIzaSyACHT2--KMGtEMkGYbquBQe-39bLPO9XX8</string>
+    <string name="google_storage_bucket" translatable="false">mediflow-d4ccc.firebasestorage.app</string>
+    <string name="project_id" translatable="false">mediflow-d4ccc</string>
+</resources>

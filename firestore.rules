@@ -1,0 +1,95 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function role() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? profile().role : 'anonymous';
+    }
+
+    function isAdmin() {
+      return role() == 'admin';
+    }
+
+    function isPharmacistOf(pharmacyId) {
+      return role() == 'pharmacist' && profile().pharmacyId == pharmacyId;
+    }
+
+    // The catalogue and the pharmacy registry are world-readable: a patient
+    // must be able to search before signing in. Only the admin writes them.
+    match /medicines/{medicineId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /pharmacies/{pharmacyId} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || isPharmacistOf(pharmacyId);
+
+      match /stock/{medicineId} {
+        allow read: if true;
+        allow write: if isAdmin() || isPharmacistOf(pharmacyId);
+      }
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow create: if signedIn() && (request.auth.uid == userId || isAdmin());
+      // A user may edit their own details but never their own role or active status.
+      allow update: if isAdmin() ||
+        (signedIn() && request.auth.uid == userId &&
+         request.resource.data.uid == resource.data.uid &&
+         request.resource.data.role == resource.data.role &&
+         request.resource.data.status == resource.data.status);
+      allow delete: if isAdmin();
+    }
+
+    // In-app inbox. A patient sees only their own rows; a pharmacist only rows
+    // addressed to the branch they own. Nobody reads anybody else's mail.
+    match /notifications/{notificationId} {
+      allow read: if isAdmin() ||
+        (signedIn() && resource.data.patientUid == request.auth.uid) ||
+        isPharmacistOf(resource.data.pharmacyId);
+      allow create: if isAdmin() ||
+        (signedIn() && request.resource.data.patientUid == request.auth.uid) ||
+        isPharmacistOf(request.resource.data.pharmacyId);
+      allow update: if isAdmin() ||
+        (signedIn() && resource.data.patientUid == request.auth.uid) ||
+        isPharmacistOf(resource.data.pharmacyId);
+      allow delete: if isAdmin();
+    }
+
+    // Sign-in directory: lets a second identifier (a patient's NIC as well as their
+    // phone) resolve to the account's synthetic email before anyone is authenticated.
+    // It holds no secret — knowing the address still does not give the password.
+    match /logins/{loginKey} {
+      allow read: if true;
+      allow create: if isAdmin() ||
+        (signedIn() && request.resource.data.uid == request.auth.uid &&
+         request.resource.data.email == request.auth.token.email);
+      allow update, delete: if isAdmin();
+    }
+
+    match /reservations/{reservationId} {
+      allow read: if isAdmin() ||
+        (signedIn() && resource.data.patientUid == request.auth.uid) ||
+        isPharmacistOf(resource.data.pharmacyId);
+
+      allow create: if signedIn() && request.resource.data.patientUid == request.auth.uid;
+      allow update: if isAdmin() ||
+        isPharmacistOf(resource.data.pharmacyId) ||
+        (signedIn() && resource.data.patientUid == request.auth.uid);
+      allow delete: if isAdmin();
+    }
+  }
+}

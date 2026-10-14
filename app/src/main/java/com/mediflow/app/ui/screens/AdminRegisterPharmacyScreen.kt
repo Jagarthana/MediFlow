@@ -43,8 +43,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.auth.SyntheticEmail
+import com.mediflow.app.data.remote.AdminRepository
+import com.mediflow.app.data.remote.PharmacyRegistration
+import com.mediflow.app.data.remote.RegisteredBranch
 import com.mediflow.app.ui.theme.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -136,13 +140,6 @@ private val srilankaProvinces = listOf(
     )
 )
 
-private data class UploadedLicense(
-    val fileName: String,
-    val fileSize: String,
-    val uploadDate: String,
-    val mimeType: String = "application/pdf"
-)
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen Host
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,34 +155,29 @@ fun AdminRegisterPharmacyScreen(
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Step 1 State: Pharmacy Info
-    var pharmacyName by rememberSaveable { mutableStateOf("HealthNet Central Pharmacy") }
-    var slmcRegNumber by rememberSaveable { mutableStateOf("SLMC-PH-8492") }
-    var slmcPin by rememberSaveable { mutableStateOf("4819") }
+    var pharmacyName by rememberSaveable { mutableStateOf("") }
+    var slmcRegNumber by rememberSaveable { mutableStateOf("") }
+    var slmcPin by rememberSaveable { mutableStateOf("") }
     var isPinVisible by rememberSaveable { mutableStateOf(false) }
 
-    // Step 2 State: License Upload
-    var uploadedLicense by remember {
-        mutableStateOf<UploadedLicense?>(
-            UploadedLicense(
-                fileName = "SLMC_Accreditation_Certificate_2026.pdf",
-                fileSize = "1.8 MB",
-                uploadDate = "Today, 11:30 AM"
-            )
-        )
-    }
-    var isUploading by remember { mutableStateOf(false) }
+    // Step 2 State: the pharmacist account this branch signs in with.
+    var pharmacistName by rememberSaveable { mutableStateOf("") }
+    var pharmacistId by rememberSaveable { mutableStateOf("") }
+    var temporaryPassword by rememberSaveable { mutableStateOf("") }
+    var isPasswordVisible by rememberSaveable { mutableStateOf(false) }
 
     // Step 3 State: Location & Contact
-    var selectedProvince by rememberSaveable { mutableStateOf("Western Province") }
-    var selectedDistrict by rememberSaveable { mutableStateOf("Colombo District") }
-    var selectedTown by rememberSaveable { mutableStateOf("Colombo 07") }
-    var addressLine1 by rememberSaveable { mutableStateOf("No. 142, Ward Place") }
-    var addressLine2 by rememberSaveable { mutableStateOf("Colombo 00700") }
-    var contactNumber by rememberSaveable { mutableStateOf("+94 11 268 4590") }
-    var contactEmail by rememberSaveable { mutableStateOf("admin@healthnet.lk") }
+    var selectedProvince by rememberSaveable { mutableStateOf(srilankaProvinces.first().name) }
+    var selectedDistrict by rememberSaveable { mutableStateOf(srilankaProvinces.first().districts.first().name) }
+    var selectedTown by rememberSaveable { mutableStateOf(srilankaProvinces.first().districts.first().towns.first()) }
+    var addressLine1 by rememberSaveable { mutableStateOf("") }
+    var addressLine2 by rememberSaveable { mutableStateOf("") }
+    var contactNumber by rememberSaveable { mutableStateOf("") }
+    var contactEmail by rememberSaveable { mutableStateOf("") }
 
     var isSubmitting by remember { mutableStateOf(false) }
     var showSuccessDialog by remember { mutableStateOf(false) }
+    var registered by remember { mutableStateOf<RegisteredBranch?>(null) }
 
     val focusManager = LocalFocusManager.current
 
@@ -206,8 +198,22 @@ fun AdminRegisterPharmacyScreen(
     }
 
     fun validateStep2(): Boolean {
-        if (uploadedLicense == null) {
-            scope.launch { snackbarHostState.showSnackbar("Please upload the SLMC license certificate to proceed") }
+        if (pharmacistName.trim().length < 3) {
+            scope.launch { snackbarHostState.showSnackbar("Enter the pharmacist's full name") }
+            return false
+        }
+        if (SyntheticEmail.forPharmacist(pharmacistId) == null) {
+            scope.launch {
+                snackbarHostState.showSnackbar("A pharmacist ID is 3 to 32 letters, numbers or dashes")
+            }
+            return false
+        }
+        if (temporaryPassword.length < AdminRepository.MIN_PASSWORD) {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "The temporary password needs at least ${AdminRepository.MIN_PASSWORD} characters"
+                )
+            }
             return false
         }
         return true
@@ -246,9 +252,34 @@ fun AdminRegisterPharmacyScreen(
                 if (validateStep3()) {
                     scope.launch {
                         isSubmitting = true
-                        delay(1200)
+                        val outcome = AppGraph.admin.registerPharmacy(
+                            PharmacyRegistration(
+                                name = pharmacyName,
+                                licenceNumber = slmcRegNumber,
+                                slmcPin = slmcPin,
+                                province = selectedProvince.removeSuffix(" Province"),
+                                district = selectedDistrict.removeSuffix(" District"),
+                                town = selectedTown,
+                                addressLine1 = addressLine1,
+                                addressLine2 = addressLine2,
+                                branchPhone = contactNumber,
+                                branchEmail = contactEmail,
+                                pharmacistName = pharmacistName,
+                                pharmacistId = pharmacistId,
+                                temporaryPassword = temporaryPassword
+                            )
+                        )
                         isSubmitting = false
-                        showSuccessDialog = true
+                        outcome
+                            .onSuccess {
+                                registered = it
+                                showSuccessDialog = true
+                            }
+                            .onFailure {
+                                snackbarHostState.showSnackbar(
+                                    it.message ?: "The registration could not be completed."
+                                )
+                            }
                     }
                 }
             }
@@ -311,26 +342,15 @@ fun AdminRegisterPharmacyScreen(
                         onTogglePinVisibility = { isPinVisible = !isPinVisible }
                     )
 
-                    2 -> Step2LicenseUpload(
-                        license = uploadedLicense,
-                        isUploading = isUploading,
-                        onAttachDefaultLicense = {
-                            scope.launch {
-                                isUploading = true
-                                delay(800)
-                                uploadedLicense = UploadedLicense(
-                                    fileName = "SLMC_Accreditation_Certificate_2026.pdf",
-                                    fileSize = "1.8 MB",
-                                    uploadDate = "Today, Just now"
-                                )
-                                isUploading = false
-                                snackbarHostState.showSnackbar("SLMC License certificate attached successfully")
-                            }
-                        },
-                        onRemoveLicense = {
-                            uploadedLicense = null
-                            scope.launch { snackbarHostState.showSnackbar("Document removed") }
-                        }
+                    2 -> Step2PharmacistSignIn(
+                        pharmacistName = pharmacistName,
+                        onPharmacistNameChange = { pharmacistName = it },
+                        pharmacistId = pharmacistId,
+                        onPharmacistIdChange = { pharmacistId = it },
+                        temporaryPassword = temporaryPassword,
+                        onPasswordChange = { temporaryPassword = it },
+                        isPasswordVisible = isPasswordVisible,
+                        onTogglePasswordVisibility = { isPasswordVisible = !isPasswordVisible }
                     )
 
                     3 -> Step3LocationContact(
@@ -366,16 +386,19 @@ fun AdminRegisterPharmacyScreen(
         }
     }
 
-    if (showSuccessDialog) {
-        RegistrationSuccessDialog(
-            pharmacyName = pharmacyName,
-            slmcRegNumber = slmcRegNumber,
-            town = selectedTown,
-            onDismiss = {
-                showSuccessDialog = false
-                onRegistrationComplete()
-            }
-        )
+    registered?.let { created ->
+        if (showSuccessDialog) {
+            RegistrationSuccessDialog(
+                pharmacyName = pharmacyName,
+                slmcRegNumber = slmcRegNumber,
+                town = selectedTown,
+                registration = created,
+                onDismiss = {
+                    showSuccessDialog = false
+                    onRegistrationComplete()
+                }
+            )
+        }
     }
 }
 
@@ -457,7 +480,7 @@ private fun RegisterPharmacyTopBar(
 
 @Composable
 private fun WizardStepIndicator(currentStep: Int) {
-    val steps = listOf("Pharmacy Info", "License Upload", "Location & Contact")
+    val steps = listOf("Pharmacy Info", "Pharmacist Sign-in", "Location & Contact")
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -660,7 +683,8 @@ private fun Step1PharmacyInfo(
                 Icon(Icons.Rounded.Shield, null, tint = HealthcareBlue, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    text = "Credentials are encrypted and cross-referenced with the SLMC registry ledger.",
+                    text = "Both are stored on the branch record in Firestore. Nothing here is checked " +
+                            "against an external SLMC ledger — verification is this console's own decision.",
                     fontSize = 12.sp,
                     color = DarkSlate,
                     lineHeight = 16.sp
@@ -671,219 +695,111 @@ private fun Step1PharmacyInfo(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 2: License Upload
+// Step 2: Pharmacist sign-in — the account this branch will log in with
 // ─────────────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Step2LicenseUpload(
-    license: UploadedLicense?,
-    isUploading: Boolean,
-    onAttachDefaultLicense: () -> Unit,
-    onRemoveLicense: () -> Unit
+private fun Step2PharmacistSignIn(
+    pharmacistName: String,
+    onPharmacistNameChange: (String) -> Unit,
+    pharmacistId: String,
+    onPharmacistIdChange: (String) -> Unit,
+    temporaryPassword: String,
+    onPasswordChange: (String) -> Unit,
+    isPasswordVisible: Boolean,
+    onTogglePasswordVisibility: () -> Unit
 ) {
+    val resolvedEmail = SyntheticEmail.forPharmacist(pharmacistId)
+
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionTitle(
-            title = "License & Accreditation",
-            subtitle = "Attach official SLMC pharmacy operating license (PDF or JPG/PNG)"
+            title = "Pharmacist Sign-in",
+            subtitle = "The account that manages this branch's shelf. It is created the moment the registration is saved."
         )
 
         Spacer(Modifier.height(16.dp))
 
-        // Upload Drag & Drop area simulation
-        val strokeColor = if (license != null) SuccessGreen else ForestEmerald.copy(alpha = 0.6f)
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(170.dp)
-                .drawBehind {
-                    val stroke = Stroke(
-                        width = 2.dp.toPx(),
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(16f, 16f), 0f)
-                    )
-                    drawRoundRect(
-                        color = strokeColor,
-                        cornerRadius = CornerRadius(14.dp.toPx()),
-                        style = stroke
-                    )
-                }
-                .clip(RoundedCornerShape(14.dp))
-                .background(if (license != null) SuccessGreen.copy(alpha = 0.04f) else ForestEmerald.copy(alpha = 0.03f))
-                .clickable(enabled = !isUploading) { onAttachDefaultLicense() }
-                .semantics { contentDescription = "Upload License. Tap to browse or attach certificate" },
-            contentAlignment = Alignment.Center
-        ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(16.dp)
-            ) {
-                if (isUploading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(32.dp),
-                        color = ForestEmerald,
-                        strokeWidth = 3.dp
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = "Verifying & Uploading document...",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = ForestEmerald
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(CircleShape)
-                            .background(ForestEmerald.copy(alpha = 0.12f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CloudUpload,
-                            contentDescription = null,
-                            tint = ForestEmerald,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = "Upload License (PDF / JPG)",
-                        fontSize = 14.5.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = DarkSlate
-                    )
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        text = "Drag and drop or tap to select from device (Max 10 MB)",
-                        fontSize = 12.sp,
-                        color = SlateMedium,
-                        textAlign = TextAlign.Center
-                    )
-                }
-            }
-        }
+        FormLabel(label = "Pharmacist Full Name *")
+        OutlinedTextField(
+            value = pharmacistName,
+            onValueChange = onPharmacistNameChange,
+            placeholder = { Text("e.g. Pradeep Wijesinghe") },
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            colors = formTextFieldColors(),
+            modifier = Modifier.fillMaxWidth()
+        )
 
         Spacer(Modifier.height(14.dp))
 
-        // Direct Attach SLMC Certificate Button
-        OutlinedButton(
-            onClick = onAttachDefaultLicense,
-            enabled = !isUploading,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .semantics { contentDescription = "Attach SLMC Certificate" },
+        FormLabel(label = "Pharmacist ID *")
+        OutlinedTextField(
+            value = pharmacistId,
+            onValueChange = onPharmacistIdChange,
+            placeholder = { Text("e.g. 0103") },
+            singleLine = true,
+            supportingText = {
+                Text(
+                    text = resolvedEmail?.let { "Firebase addresses this account as $it." }
+                        ?: "3 to 32 letters, numbers or dashes.",
+                    fontSize = 11.5.sp,
+                    color = if (resolvedEmail == null) AmberWarning else SlateMedium
+                )
+            },
             shape = RoundedCornerShape(12.dp),
-            border = BorderStroke(1.5.dp, ForestEmerald),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = ForestEmerald)
-        ) {
-            Icon(Icons.Rounded.AttachFile, null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = "Attach SLMC Certificate",
-                fontSize = 13.5.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            colors = formTextFieldColors(),
+            modifier = Modifier.fillMaxWidth()
+        )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(14.dp))
 
-        // File preview with remove option
-        if (license != null) {
-            FormLabel(label = "Attached Certificate")
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-                color = SurfaceWhite,
-                border = BorderStroke(1.dp, BorderColor)
-            ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(ForestEmerald.copy(alpha = 0.12f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.PictureAsPdf,
-                            contentDescription = null,
-                            tint = ForestEmerald,
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.width(12.dp))
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = license.fileName,
-                            fontSize = 13.5.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = DarkSlate,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = "${license.fileSize} · ${license.uploadDate}",
-                            fontSize = 11.5.sp,
-                            color = SlateMedium
-                        )
-                    }
-
-                    Surface(
-                        shape = CircleShape,
-                        color = SuccessGreen.copy(alpha = 0.12f)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Rounded.CheckCircle, null, tint = SuccessGreen, modifier = Modifier.size(14.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Ready", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SuccessGreen)
-                        }
-                    }
-
-                    Spacer(Modifier.width(6.dp))
-
-                    IconButton(
-                        onClick = onRemoveLicense,
-                        modifier = Modifier
-                            .size(36.dp)
-                            .semantics { contentDescription = "Remove attached certificate" }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.DeleteOutline,
-                            contentDescription = null,
-                            tint = ErrorRed,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-            }
-        } else {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = AmberWarning.copy(alpha = 0.08f),
-                border = BorderStroke(1.dp, AmberWarning.copy(alpha = 0.25f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Rounded.WarningAmber, null, tint = AmberWarning, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        text = "No document attached yet. Please upload a valid SLMC registration certificate.",
-                        fontSize = 12.sp,
-                        color = DarkSlate,
-                        lineHeight = 16.sp
+        FormLabel(label = "Temporary Password *")
+        OutlinedTextField(
+            value = temporaryPassword,
+            onValueChange = onPasswordChange,
+            placeholder = { Text("At least 6 characters") },
+            singleLine = true,
+            visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = onTogglePasswordVisibility) {
+                    Icon(
+                        imageVector = if (isPasswordVisible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                        contentDescription = if (isPasswordVisible) "Hide the password" else "Show the password"
                     )
                 }
+            },
+            shape = RoundedCornerShape(12.dp),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Done
+            ),
+            colors = formTextFieldColors(),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = HealthcareBlue.copy(alpha = 0.08f),
+            border = BorderStroke(1.dp, HealthcareBlue.copy(alpha = 0.25f))
+        ) {
+            Row(
+                modifier = Modifier.padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Shield, null, tint = HealthcareBlue, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = "The password goes to Firebase Auth and is never written to a document. " +
+                            "Hand it to the pharmacist out of band; only an admin can set a new one afterwards.",
+                    fontSize = 12.sp,
+                    color = DarkSlate,
+                    lineHeight = 16.sp
+                )
             }
         }
     }
@@ -1115,9 +1031,9 @@ private fun RegisterPharmacyBottomBar(
     onBack: () -> Unit
 ) {
     val nextButtonText = when (currentStep) {
-        1 -> "Save & Next: License"
+        1 -> "Save & Next: Pharmacist"
         2 -> "Save & Next: Location"
-        else -> "Complete Registration"
+        else -> "Create Branch and Login"
     }
 
     val nextIcon = when (currentStep) {
@@ -1202,6 +1118,7 @@ private fun RegistrationSuccessDialog(
     pharmacyName: String,
     slmcRegNumber: String,
     town: String,
+    registration: RegisteredBranch,
     onDismiss: () -> Unit
 ) {
     Dialog(
@@ -1247,7 +1164,7 @@ private fun RegistrationSuccessDialog(
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    text = "$pharmacyName has been registered under SLMC Reg #$slmcRegNumber ($town) and added to the national directory.",
+                    text = "$pharmacyName is written to the branch registry under SLMC Reg #$slmcRegNumber ($town).",
                     fontSize = 13.sp,
                     color = SlateMedium,
                     textAlign = TextAlign.Center,
@@ -1262,18 +1179,39 @@ private fun RegistrationSuccessDialog(
                     color = LightBackground,
                     border = BorderStroke(1.dp, BorderColor)
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(Icons.Rounded.VerifiedUser, null, tint = ForestEmerald, modifier = Modifier.size(20.dp))
-                        Spacer(Modifier.width(10.dp))
-                        Text(
-                            text = "Status: Provisionally Approved & Ready for Dispatch",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = ForestEmerald
+                        RegistrationFactRow(
+                            icon = Icons.Rounded.Domain,
+                            label = "Branch id",
+                            value = registration.pharmacyId
                         )
+                        RegistrationFactRow(
+                            icon = Icons.Rounded.Person,
+                            label = "Pharmacist signs in with",
+                            value = registration.signInIdentifier
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Rounded.Info,
+                                null,
+                                tint = AmberWarning,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "Status: pending. Patients will not see this branch until it is approved " +
+                                        "in the pharmacy list, but the pharmacist can sign in right away.",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = DarkSlate,
+                                lineHeight = 16.sp
+                            )
+                        }
                     }
                 }
 
@@ -1345,3 +1283,19 @@ private fun formTextFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedTextColor = DarkSlate,
     unfocusedTextColor = DarkSlate
 )
+
+@Composable
+private fun RegistrationFactRow(icon: ImageVector, label: String, value: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, tint = ForestEmerald, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(10.dp))
+        Text(text = "$label: ", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = SlateMedium)
+        Text(
+            text = value,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = DarkSlate,
+            modifier = Modifier.semantics { contentDescription = "$label $value" }
+        )
+    }
+}

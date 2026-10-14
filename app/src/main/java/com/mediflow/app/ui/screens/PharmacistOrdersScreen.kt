@@ -17,7 +17,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -25,13 +24,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -39,181 +38,126 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.mediflow.app.data.model.Reservation
+import com.mediflow.app.data.model.ReservationItem
+import com.mediflow.app.data.model.ReservationStatus
+import com.mediflow.app.ui.components.SlipImage
 import com.mediflow.app.ui.theme.*
+import java.text.DateFormat
+import java.util.Date
 import kotlin.math.roundToInt
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 /**
  * Screen 13 — Pharmacist Order Review & Dual-View Workstation (Variant B / Figma P2)
  *
- * The Orders tab of the pharmacist host. Two views share one pane: the live
- * queue (tap a card) and the per-order review (prescription preview with
- * pinch-zoom/pan, patient, shelf location, per-item verification checkboxes,
- * then Reject or Mark as Ready for Pickup). The desktop Alt+A / Alt+R
- * shortcuts become the two big bottom buttons here.
+ * The Orders tab of the pharmacist host. Two views share one pane: the live queue and the
+ * per-order review (the patient's real photographed slip with pinch-zoom/pan, the basket with
+ * per-item verification checkboxes, then Reject, Mark as Ready for Pickup, or hand the bag
+ * over). The desktop Alt+A / Alt+R shortcuts become the big bottom buttons here.
  *
- * Everything is local simulated state, in line with the UI-only prototype:
- * the queue "loads" behind a short delay, a new order arrives on a timer with
- * a ToneGenerator chime and a badge on the notification bell, and status
- * writes go nowhere yet (`// TODO(backend)` territory).
+ * The queue is a Firestore snapshot listener over this branch's reservations, so a hold placed
+ * on a patient's phone arrives here while the pharmacist is looking at the screen. Every button
+ * writes that document and answers it with a message in the patient's inbox.
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Order model + UI-phase sample data
+// Queue view model
 // ─────────────────────────────────────────────────────────────────────────────
 
 internal enum class OrderStatus(val label: String) {
     PENDING("Pending"),
     READY("Ready for Pickup"),
-    REJECTED("Rejected")
+    COLLECTED("Collected"),
+    REJECTED("Rejected"),
+    EXPIRED("Expired")
 }
 
-internal data class OrderItem(val name: String, val strength: String, val quantity: Int)
+internal data class OrderItem(val medicineId: String, val name: String, val strength: String, val quantity: Int)
 
 internal data class PharmOrder(
-    val ref: Int,
+    val reservationId: String,
+    val patientUid: String,
+    val reference: String,
     val patient: String,
     val placedAt: String,
-    val shelf: String,
     val items: List<OrderItem>,
-    val status: OrderStatus = OrderStatus.PENDING
+    val status: OrderStatus,
+    val slipPath: String?,
+    val counterCode: String,
+    val totalLabel: String,
+    val completedAt: String?,
+    val cancelReason: String?
 ) {
     val itemCountLabel: String get() = "${items.size} ${if (items.size == 1) "item" else "items"}"
+
+    /** The shelf lines the hand-over books off, in the form the repository expects. */
+    val shelfLines: List<ReservationItem>
+        get() = items.map { line ->
+            ReservationItem(
+                medicineId = line.medicineId,
+                name = line.name,
+                strength = line.strength,
+                form = "",
+                quantity = line.quantity,
+                unitPriceLKR = 0.0
+            )
+        }
 }
 
-private val seedOrders = listOf(
-    PharmOrder(
-        ref = 1024,
-        patient = "Kavindi Perera",
-        placedAt = "Today, 10:42 AM",
-        shelf = "Cabinet B-12",
-        items = listOf(
-            OrderItem("Paracetamol", "500 mg", 2),
-            OrderItem("Amoxicillin", "250 mg", 1)
-        )
-    ),
-    PharmOrder(
-        ref = 1025,
-        patient = "Nadeesha Silva",
-        placedAt = "Today, 11:05 AM",
-        shelf = "Cabinet A-04",
-        items = listOf(
-            OrderItem("Cetirizine", "10 mg", 1),
-            OrderItem("Oral Rehydration Salts", "20.5 g · Sachet", 3),
-            OrderItem("Omeprazole", "20 mg", 2)
-        )
-    ),
-    PharmOrder(
-        ref = 1026,
-        patient = "Ruwan Jayasuriya",
-        placedAt = "Today, 11:31 AM",
-        shelf = "Shelf C-03",
-        items = listOf(
-            OrderItem("Salbutamol", "100 mcg · Inhaler", 1)
-        )
-    )
-)
+private val queueStampFormat = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
 
-/** Arrive on a timer so the queue visibly updates while the app is open. */
-private val incomingOrders = listOf(
-    PharmOrder(
-        ref = 1027,
-        patient = "Ishara Fernando",
-        placedAt = "Just now",
-        shelf = "Cabinet D-07",
-        items = listOf(
-            OrderItem("Metformin", "500 mg", 2),
-            OrderItem("Atorvastatin", "20 mg", 1)
-        )
-    ),
-    PharmOrder(
-        ref = 1028,
-        patient = "Dilani Rodrigo",
-        placedAt = "Just now",
-        shelf = "Cabinet B-03",
-        items = listOf(
-            OrderItem("Azithromycin", "500 mg", 1),
-            OrderItem("Paracetamol", "650 mg", 2)
-        )
-    )
+internal fun Reservation.toPharmOrder(): PharmOrder = PharmOrder(
+    reservationId = reservationId,
+    patientUid = patientUid,
+    reference = reference,
+    patient = patientName,
+    placedAt = queueStampFormat.format(Date(createdAtMillis)),
+    items = items.map { OrderItem(it.medicineId, it.name, it.strength, it.quantity) },
+    status = when (displayStatus()) {
+        ReservationStatus.RESERVED -> OrderStatus.PENDING
+        ReservationStatus.READY -> OrderStatus.READY
+        ReservationStatus.COLLECTED -> OrderStatus.COLLECTED
+        ReservationStatus.CANCELLED -> OrderStatus.REJECTED
+        ReservationStatus.EXPIRED -> OrderStatus.EXPIRED
+    },
+    slipPath = prescriptionStoragePath,
+    counterCode = counterCode,
+    totalLabel = "LKR %,.2f".format(totalLKR),
+    completedAt = completedAtMillis?.let { queueStampFormat.format(Date(it)) },
+    cancelReason = cancelReason?.takeIf { it.isNotBlank() }
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Order book — simulated queue state shared by the queue and review views
+// Per-item verification — the pharmacist's tick-list before a status write
 // ─────────────────────────────────────────────────────────────────────────────
 
-internal class OrderBook(
-    val orders: SnapshotStateList<PharmOrder>,
-    val verified: SnapshotStateMap<String, Boolean>,
-    val isLoading: MutableState<Boolean>,
-    val unread: MutableIntState,
-    val snackbar: SnackbarHostState,
-    private val chime: ToneGenerator?
-) {
-    private fun key(order: PharmOrder, index: Int) = "${order.ref}:$index"
+internal class VerificationTracker(private val marks: SnapshotStateMap<String, Boolean>) {
+    fun isVerified(order: PharmOrder, index: Int): Boolean = marks["${order.reservationId}:$index"] == true
 
-    fun isVerified(order: PharmOrder, index: Int): Boolean = verified[key(order, index)] == true
+    fun allVerified(order: PharmOrder): Boolean = order.items.indices.all { isVerified(order, it) }
 
-    fun allVerified(order: PharmOrder): Boolean =
-        order.items.indices.all { isVerified(order, it) }
-
-    fun verifiedCount(order: PharmOrder): Int =
-        order.items.indices.count { isVerified(order, it) }
+    fun verifiedCount(order: PharmOrder): Int = order.items.indices.count { isVerified(order, it) }
 
     fun toggleItem(order: PharmOrder, index: Int) {
-        verified[key(order, index)] = !isVerified(order, index)
-    }
-
-    fun setStatus(order: PharmOrder, status: OrderStatus) {
-        val i = orders.indexOfFirst { it.ref == order.ref }
-        if (i >= 0) orders[i] = orders[i].copy(status = status)
-    }
-
-    fun playChime() {
-        runCatching { chime?.startTone(ToneGenerator.TONE_PROP_ACK, 250) }
-    }
-
-    /** Clears the bell badge and returns the alert summary to show. */
-    fun reviewAlerts(): String {
-        val count = unread.intValue
-        unread.intValue = 0
-        return if (count == 0) "No new order alerts."
-        else "$count new order ${if (count == 1) "alert" else "alerts"} — newest at the top of the queue."
+        val key = "${order.reservationId}:$index"
+        marks[key] = marks[key] != true
     }
 }
 
 @Composable
-internal fun rememberOrderBook(snackbarHostState: SnackbarHostState): OrderBook {
-    val orders = remember { mutableStateListOf<PharmOrder>() }
-    val verified = remember { mutableStateMapOf<String, Boolean>() }
-    val isLoading = remember { mutableStateOf(true) }
-    val unread = remember { mutableIntStateOf(0) }
-    val chime = remember {
-        runCatching { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85) }.getOrNull()
-    }
+internal fun rememberVerificationTracker(): VerificationTracker {
+    val marks = remember { mutableStateMapOf<String, Boolean>() }
+    return remember(marks) { VerificationTracker(marks) }
+}
 
-    DisposableEffect(chime) {
-        onDispose { runCatching { chime?.release() } }
+/** The counter chime, fired by the host when a genuinely new hold reaches the queue. */
+@Composable
+internal fun rememberOrderChime(): () -> Unit {
+    val player = remember { runCatching { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85) }.getOrNull() }
+    DisposableEffect(player) {
+        onDispose { runCatching { player?.release() } }
     }
-
-    // Simulated socket: initial fetch, then push arrivals while the app is open.
-    LaunchedEffect(Unit) {
-        delay(900)
-        orders.addAll(seedOrders)
-        isLoading.value = false
-        incomingOrders.forEach { incoming ->
-            delay(20_000)
-            orders.add(0, incoming)
-            unread.intValue += 1
-            runCatching { chime?.startTone(ToneGenerator.TONE_PROP_ACK, 250) }
-            snackbarHostState.showSnackbar("New order received: REF# ${incoming.ref}")
-        }
-    }
-
-    return remember(orders, verified, isLoading, unread, snackbarHostState, chime) {
-        OrderBook(orders, verified, isLoading, unread, snackbarHostState, chime)
-    }
+    return remember(player) { { runCatching { player?.startTone(ToneGenerator.TONE_PROP_ACK, 250) } } }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,8 +165,13 @@ internal fun rememberOrderBook(snackbarHostState: SnackbarHostState): OrderBook 
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-internal fun OrdersQueuePane(book: OrderBook, onOpenOrder: (Int) -> Unit) {
-    if (book.isLoading.value) {
+internal fun OrdersQueuePane(
+    orders: List<PharmOrder>,
+    isLoading: Boolean,
+    loadFailed: Boolean,
+    onOpenOrder: (String) -> Unit
+) {
+    if (isLoading) {
         Column(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Center,
@@ -230,7 +179,7 @@ internal fun OrdersQueuePane(book: OrderBook, onOpenOrder: (Int) -> Unit) {
         ) {
             CircularProgressIndicator(color = ForestEmerald, strokeWidth = 3.dp)
             Spacer(Modifier.height(14.dp))
-            Text(text = "Loading live orders…", fontSize = 13.5.sp, color = SlateMedium)
+            Text(text = "Opening the branch queue…", fontSize = 13.5.sp, color = SlateMedium)
         }
         return
     }
@@ -243,7 +192,7 @@ internal fun OrdersQueuePane(book: OrderBook, onOpenOrder: (Int) -> Unit) {
         item {
             Column(modifier = Modifier.padding(vertical = 6.dp)) {
                 Text(
-                    text = "Live Orders Queue (${book.orders.size})",
+                    text = "Live Orders Queue (${orders.size})",
                     style = MaterialTheme.typography.titleLarge.copy(
                         color = DarkSlate,
                         fontWeight = FontWeight.Bold,
@@ -252,18 +201,20 @@ internal fun OrdersQueuePane(book: OrderBook, onOpenOrder: (Int) -> Unit) {
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "Tap an order to review the prescription and verify items.",
+                    text = if (loadFailed)
+                        "The queue could not be read from Firestore. Check the sign-in, then re-open this tab."
+                    else "Tap an order to review the prescription and verify items.",
                     fontSize = 12.5.sp,
-                    color = SlateMedium
+                    color = if (loadFailed) ErrorRed else SlateMedium
                 )
             }
         }
 
-        if (book.orders.isEmpty()) {
+        if (orders.isEmpty()) {
             item { EmptyQueueState() }
         } else {
-            items(book.orders.toList(), key = { it.ref }) { order ->
-                OrderQueueCard(order = order, onOpen = { onOpenOrder(order.ref) })
+            items(orders, key = { it.reservationId }) { order ->
+                OrderQueueCard(order = order, onOpen = { onOpenOrder(order.reservationId) })
             }
         }
     }
@@ -311,7 +262,7 @@ private fun OrderQueueCard(order: PharmOrder, onOpen: () -> Unit) {
             .clickable(onClick = onOpen)
             .semantics {
                 contentDescription =
-                    "Order REF# ${order.ref}, ${order.patient}, ${order.itemCountLabel}, ${order.status.label}. Tap to review."
+                    "Order ${order.reference}, ${order.patient}, ${order.itemCountLabel}, ${order.status.label}. Tap to review."
             },
         shape = RoundedCornerShape(16.dp),
         color = SurfaceWhite,
@@ -325,7 +276,7 @@ private fun OrderQueueCard(order: PharmOrder, onOpen: () -> Unit) {
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "REF# ${order.ref}",
+                    text = order.reference,
                     style = MaterialTheme.typography.titleMedium.copy(
                         color = DarkSlate,
                         fontWeight = FontWeight.Bold,
@@ -369,7 +320,9 @@ internal fun OrderStatusBadge(status: OrderStatus) {
     val (tint, background) = when (status) {
         OrderStatus.PENDING -> AmberWarning to AmberWarning.copy(alpha = 0.14f)
         OrderStatus.READY -> SuccessGreen to SuccessGreen.copy(alpha = 0.14f)
+        OrderStatus.COLLECTED -> HealthcareBlue to HealthcareBlue.copy(alpha = 0.12f)
         OrderStatus.REJECTED -> ErrorRed to ErrorRed.copy(alpha = 0.12f)
+        OrderStatus.EXPIRED -> SlateMedium to SlateMedium.copy(alpha = 0.12f)
     }
     Surface(
         shape = RoundedCornerShape(8.dp),
@@ -403,11 +356,18 @@ internal fun OrderStatusBadge(status: OrderStatus) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> Unit) {
-    val scope = rememberCoroutineScope()
+internal fun OrderReviewPane(
+    order: PharmOrder,
+    tracker: VerificationTracker,
+    isBusy: Boolean,
+    onReady: () -> Unit,
+    onReject: () -> Unit,
+    onHandOver: () -> Unit
+) {
     var showRejectDialog by remember { mutableStateOf(false) }
     var showFullScreen by remember { mutableStateOf(false) }
-    val settled = order.status != OrderStatus.PENDING
+    val awaitingAction = order.status == OrderStatus.PENDING
+    val readyForHandover = order.status == OrderStatus.READY
 
     Column(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -422,30 +382,32 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
             InfoRow(
                 icon = Icons.Rounded.Person,
                 tint = HealthcareBlue,
-                text = buildAnnotatedString {
-                    pushStyle(SpanStyle(color = SlateMedium, fontWeight = FontWeight.Medium))
-                    append("Patient: ")
-                    pop()
-                    pushStyle(SpanStyle(color = DarkSlate, fontWeight = FontWeight.Bold))
-                    append(order.patient)
-                    pop()
-                },
+                text = labelled("Patient: ", order.patient),
                 contentDescription = "Patient: ${order.patient}"
             )
 
             Spacer(Modifier.height(10.dp))
             InfoRow(
-                icon = Icons.Rounded.Place,
+                icon = Icons.Rounded.Schedule,
                 tint = AmberWarning,
-                text = buildAnnotatedString {
-                    pushStyle(SpanStyle(color = SlateMedium, fontWeight = FontWeight.Medium))
-                    append("Shelf Location: ")
-                    pop()
-                    pushStyle(SpanStyle(color = DarkSlate, fontWeight = FontWeight.Bold))
-                    append(order.shelf)
-                    pop()
-                },
-                contentDescription = "Shelf location ${order.shelf}"
+                text = labelled("Placed: ", order.placedAt),
+                contentDescription = "Placed ${order.placedAt}"
+            )
+
+            Spacer(Modifier.height(10.dp))
+            InfoRow(
+                icon = Icons.Rounded.Payments,
+                tint = ForestEmerald,
+                text = labelled("Total: ", order.totalLabel),
+                contentDescription = "Total ${order.totalLabel}"
+            )
+
+            Spacer(Modifier.height(10.dp))
+            InfoRow(
+                icon = Icons.Rounded.ConfirmationNumber,
+                tint = DarkSlate,
+                text = labelled("Counter code: ", order.counterCode.ifBlank { "Not issued" }),
+                contentDescription = "Counter code ${order.counterCode.ifBlank { "not issued" }}"
             )
 
             Spacer(Modifier.height(16.dp))
@@ -461,10 +423,10 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "${book.verifiedCount(order)} of ${order.items.size} verified",
+                    text = "${tracker.verifiedCount(order)} of ${order.items.size} verified",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = if (book.allVerified(order)) SuccessGreen else SlateLight
+                    color = if (tracker.allVerified(order)) SuccessGreen else SlateLight
                 )
             }
             Spacer(Modifier.height(8.dp))
@@ -472,14 +434,14 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
             order.items.forEachIndexed { index, item ->
                 MedicineVerifyCard(
                     item = item,
-                    verified = book.isVerified(order, index),
-                    enabled = !settled,
-                    onToggle = { book.toggleItem(order, index) }
+                    verified = tracker.isVerified(order, index),
+                    enabled = awaitingAction,
+                    onToggle = { tracker.toggleItem(order, index) }
                 )
                 Spacer(Modifier.height(8.dp))
             }
 
-            if (settled) {
+            if (!awaitingAction) {
                 Spacer(Modifier.height(4.dp))
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -488,7 +450,15 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
                     border = BorderStroke(1.dp, BorderColor)
                 ) {
                     Text(
-                        text = "This order was ${order.status.label.lowercase()} — no further action is needed.",
+                        text = when (order.status) {
+                            OrderStatus.READY -> "Packed and waiting at the counter. Hand it over to close it out."
+                            OrderStatus.COLLECTED ->
+                                "Collected${order.completedAt?.let { " at $it" } ?: ""} — booked off the shelf."
+                            OrderStatus.REJECTED ->
+                                "Rejected${order.cancelReason?.let { " — $it" } ?: ""}. The patient has been notified."
+                            OrderStatus.EXPIRED -> "The patient never collected this hold; it lapsed after 24 hours."
+                            OrderStatus.PENDING -> ""
+                        },
                         fontSize = 12.5.sp,
                         color = SlateMedium,
                         modifier = Modifier.padding(12.dp)
@@ -499,47 +469,51 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
         }
 
         // ── Order actions ──────────────────────────────────────────────────
-        if (!settled) {
+        if (awaitingAction || readyForHandover) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 color = SurfaceWhite,
                 border = BorderStroke(1.dp, BorderColor)
             ) {
                 Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                    MediFlowPrimaryButton(
-                        text = "Mark as Ready for Pickup",
-                        icon = Icons.Rounded.CheckCircle,
-                        contentDescription =
-                            if (book.allVerified(order)) "Mark order REF# ${order.ref} as ready for pickup"
-                            else "Verify all medicine items to enable marking ready",
-                        enabled = book.allVerified(order),
-                        onClick = {
-                            book.setStatus(order, OrderStatus.READY)
-                            scope.launch {
-                                onBack()
-                                book.snackbar.showSnackbar(
-                                    "Order #REF-${order.ref} is ready for pickup."
-                                )
-                            }
+                    if (awaitingAction) {
+                        MediFlowPrimaryButton(
+                            text = "Mark as Ready for Pickup",
+                            icon = Icons.Rounded.CheckCircle,
+                            contentDescription =
+                                if (tracker.allVerified(order)) "Mark order ${order.reference} as ready for pickup"
+                                else "Verify all medicine items to enable marking ready",
+                            enabled = tracker.allVerified(order) && !isBusy,
+                            onClick = onReady
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = { showRejectDialog = true },
+                            enabled = !isBusy,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .semantics { contentDescription = "Reject order ${order.reference}" },
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.5.dp, ErrorRed),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed)
+                        ) {
+                            Icon(Icons.Rounded.Block, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "Reject Order",
+                                fontSize = 14.5.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
                         }
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedButton(
-                        onClick = { showRejectDialog = true },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .semantics { contentDescription = "Reject order REF# ${order.ref}" },
-                        shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(1.5.dp, ErrorRed),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed)
-                    ) {
-                        Icon(Icons.Rounded.Block, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Reject Order",
-                            fontSize = 14.5.sp,
-                            fontWeight = FontWeight.SemiBold
+                    } else {
+                        MediFlowPrimaryButton(
+                            text = "Hand Over — Collected",
+                            icon = Icons.Rounded.LocalShipping,
+                            contentDescription =
+                                "Hand over ${order.reference} to ${order.patient} and book it off the shelf",
+                            enabled = !isBusy,
+                            onClick = onHandOver
                         )
                     }
                 }
@@ -553,11 +527,7 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
             onDismiss = { showRejectDialog = false },
             onConfirm = {
                 showRejectDialog = false
-                book.setStatus(order, OrderStatus.REJECTED)
-                scope.launch {
-                    onBack()
-                    book.snackbar.showSnackbar("Order #REF-${order.ref} was rejected.")
-                }
+                onReject()
             }
         )
     }
@@ -567,9 +537,18 @@ internal fun OrderReviewPane(book: OrderBook, order: PharmOrder, onBack: () -> U
     }
 }
 
+private fun labelled(prefix: String, value: String): AnnotatedString = buildAnnotatedString {
+    pushStyle(SpanStyle(color = SlateMedium, fontWeight = FontWeight.Medium))
+    append(prefix)
+    pop()
+    pushStyle(SpanStyle(color = DarkSlate, fontWeight = FontWeight.Bold))
+    append(value)
+    pop()
+}
+
 @Composable
 private fun InfoRow(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: ImageVector,
     tint: Color,
     text: AnnotatedString,
     contentDescription: String
@@ -689,7 +668,7 @@ private fun RejectOrderDialog(order: PharmOrder, onDismiss: () -> Unit, onConfir
         },
         text = {
             Text(
-                text = "Order #REF-${order.ref} for ${order.patient} will be cancelled and the " +
+                text = "Order ${order.reference} for ${order.patient} will be cancelled and the " +
                     "patient notified. This cannot be undone.",
                 fontSize = 13.5.sp
             )
@@ -697,7 +676,7 @@ private fun RejectOrderDialog(order: PharmOrder, onDismiss: () -> Unit, onConfir
         confirmButton = {
             TextButton(
                 onClick = onConfirm,
-                modifier = Modifier.semantics { contentDescription = "Confirm rejecting order REF# ${order.ref}" }
+                modifier = Modifier.semantics { contentDescription = "Confirm rejecting order ${order.reference}" }
             ) {
                 Text(
                     text = "Reject Order",
@@ -721,7 +700,7 @@ private fun RejectOrderDialog(order: PharmOrder, onDismiss: () -> Unit, onConfir
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prescription preview — pinch-to-zoom, drag/pan, full-screen viewer
+// Prescription preview — the patient's uploaded slip, pinch-to-zoom and pan
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -729,18 +708,13 @@ private fun PrescriptionPreviewCard(order: PharmOrder, onEnlarge: () -> Unit) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .semantics { contentDescription = "Prescription preview for order REF# ${order.ref}" },
+            .semantics { contentDescription = "Prescription preview for order ${order.reference}" },
         shape = RoundedCornerShape(16.dp),
         color = SurfaceWhite,
         border = BorderStroke(1.dp, BorderColor)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
-            ZoomablePrescription(
-                order = order,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(260.dp)
-            )
+            ZoomablePrescription(order = order, modifier = Modifier.fillMaxWidth().height(260.dp))
             Spacer(Modifier.height(8.dp))
             TextButton(
                 onClick = onEnlarge,
@@ -775,7 +749,7 @@ private fun ZoomablePrescription(order: PharmOrder, modifier: Modifier = Modifie
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
             .background(Color(0xFFE8EEF4))
-            .pointerInput(order.ref) {
+            .pointerInput(order.reservationId) {
                 detectTransformGestures { _, pan, zoom, _ ->
                     scale = (scale * zoom).coerceIn(1f, 4f)
                     offset = if (scale <= 1.01f) {
@@ -790,19 +764,25 @@ private fun ZoomablePrescription(order: PharmOrder, modifier: Modifier = Modifie
             }
             .semantics {
                 contentDescription =
-                    "Prescription image for order REF# ${order.ref}. Pinch to zoom, drag to pan."
+                    "Prescription image for order ${order.reference}. Pinch to zoom, drag to pan."
             },
         contentAlignment = Alignment.Center
     ) {
         Box(
-            modifier = Modifier.graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-                translationX = offset.x
-                translationY = offset.y
-            }
+            modifier = Modifier
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offset.x
+                    translationY = offset.y
+                }
+                .fillMaxSize()
         ) {
-            PrescriptionArt(order = order)
+            SlipImage(
+                path = order.slipPath,
+                modifier = Modifier.fillMaxSize().padding(12.dp),
+                label = "Prescription slip for order ${order.reference}"
+            )
         }
 
         Surface(
@@ -819,77 +799,6 @@ private fun ZoomablePrescription(order: PharmOrder, modifier: Modifier = Modifie
                 color = Color.White,
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
             )
-        }
-    }
-}
-
-/** Stand-in for the uploaded slip photo until the backend serves real images. */
-@Composable
-private fun PrescriptionArt(order: PharmOrder) {
-    Surface(
-        modifier = Modifier.padding(14.dp),
-        shape = RoundedCornerShape(6.dp),
-        color = SurfaceWhite,
-        border = BorderStroke(1.dp, BorderColor),
-        shadowElevation = 2.dp
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "Dr. A. Wickramasinghe",
-                fontSize = 14.5.sp,
-                fontWeight = FontWeight.Bold,
-                color = DarkSlate
-            )
-            Text(
-                text = "MBBS, MD (Gen. Med.) · SLMC Reg. P-4821",
-                fontSize = 10.5.sp,
-                color = SlateMedium
-            )
-            Text(
-                text = "City Clinic, Negombo · 2026-10-05",
-                fontSize = 10.5.sp,
-                color = SlateLight
-            )
-            HorizontalDivider(
-                color = BorderColor,
-                modifier = Modifier.padding(vertical = 8.dp)
-            )
-            Text(
-                text = "Patient: ${order.patient}",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = DarkSlate
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(text = "℞", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = DarkSlate)
-            Spacer(Modifier.height(4.dp))
-            order.items.forEachIndexed { index, item ->
-                Text(
-                    text = "${index + 1}. ${item.name} ${item.strength} × ${item.quantity}",
-                    fontSize = 12.5.sp,
-                    color = DarkSlate
-                )
-                Text(
-                    text = "     Sig: as directed, after meals",
-                    fontSize = 11.sp,
-                    color = SlateMedium,
-                    fontStyle = FontStyle.Italic
-                )
-                Spacer(Modifier.height(4.dp))
-            }
-            Spacer(Modifier.height(14.dp))
-            Column(modifier = Modifier.align(Alignment.End)) {
-                Text(
-                    text = "A. Wickramasinghe",
-                    fontSize = 12.5.sp,
-                    color = DarkSlate,
-                    fontStyle = FontStyle.Italic
-                )
-                HorizontalDivider(
-                    color = SlateLight,
-                    modifier = Modifier.width(130.dp)
-                )
-            }
         }
     }
 }
@@ -921,7 +830,7 @@ private fun FullScreenPrescriptionDialog(order: PharmOrder, onDismiss: () -> Uni
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Prescription — REF# ${order.ref}",
+                    text = "Prescription — ${order.reference}",
                     color = Color.White,
                     fontSize = 14.5.sp,
                     fontWeight = FontWeight.Bold,

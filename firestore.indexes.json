@@ -1,0 +1,30 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "reservations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientUid", "order": "ASCENDING" },
+        { "fieldPath": "createdAtMillis", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "reservations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pharmacyId", "order": "ASCENDING" },
+        { "fieldPath": "createdAtMillis", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "reservations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pharmacyId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAtMillis", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

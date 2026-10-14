@@ -18,6 +18,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.CartLine
+import com.mediflow.app.data.CartStore
 import com.mediflow.app.ui.components.PrescriptionThumbnail
 import com.mediflow.app.ui.theme.*
 
@@ -26,46 +28,33 @@ import com.mediflow.app.ui.theme.*
  *
  * Layout, top to bottom:
  *  • Top Bar   — back arrow + "Reservation Review"
- *  • Reserved  — "Items Reserved" card; each row has name, strength, qty, remove
- *  • Slip      — thumbnail, file name and a green verified mark
+ *  • Reserved  — the real cart; each row has name, strength, qty, remove
+ *  • Slip      — the uploaded file's name and a green mark once Storage has it;
+ *                otherwise an "Add Prescription Slip" action that opens the camera
  *  • Legal     — SLMC disclaimer checkbox, mandatory
  *  • Bottom    — "Select Pickup Pharmacy", grey until the disclaimer is accepted
  *
- * The two seeded rows are the Figma sample list; anything carried in from
- * Screen 6 is prepended. Both disappear when the backend owns the cart.
+ * The cart is [CartStore], filled by the search screen. `incomingLabel`/`incomingVariant`
+ * stay only so a deep link with no cart still shows what the route claimed.
  *
  * WCAG 2.1 AA: the whole disclaimer row is a single 48dp+ tap target, and the
  * disabled CTA keeps its label legible rather than fading to near-invisible.
  */
-
-private const val SLIP_FILE_NAME = "rx_photo_001.jpg"
-
-private data class ReservedItem(
-    val name: String,
-    val detail: String,
-    val quantity: Int
-)
-
-private val sampleReserved = listOf(
-    ReservedItem("Paracetamol 500mg", "Tablet · Panadol", 2),
-    ReservedItem("Amoxicillin 500mg", "Capsule", 1)
-)
-
 @Composable
 fun ReservationReviewScreen(
-    prescriptionAttached: Boolean,
     incomingLabel: String?,
     incomingVariant: String?,
     onBack: () -> Unit,
-    onPickPharmacy: (summaryLabel: String) -> Unit
+    onPickPharmacy: (summaryLabel: String) -> Unit,
+    onAddSlip: () -> Unit = {}
 ) {
-    val items = remember {
-        mutableStateListOf<ReservedItem>().apply {
-            if (!incomingLabel.isNullOrBlank()) {
-                add(ReservedItem(incomingLabel, incomingVariant.orEmpty(), 1))
+    val cart = CartStore.lines
+    val items = remember(cart, incomingLabel) {
+        cart.map { it.title to it.caption }
+            .ifEmpty {
+                if (incomingLabel.isNullOrBlank()) emptyList()
+                else listOf(incomingLabel to incomingVariant.orEmpty())
             }
-            addAll(sampleReserved)
-        }
     }
     var disclaimerAccepted by remember { mutableStateOf(false) }
 
@@ -76,7 +65,7 @@ fun ReservationReviewScreen(
             ReviewFooter(
                 enabled = disclaimerAccepted && items.isNotEmpty(),
                 onSelectPharmacy = {
-                    onPickPharmacy(items.firstOrNull()?.name.orEmpty())
+                    onPickPharmacy(CartStore.lines.firstOrNull()?.title ?: incomingLabel.orEmpty())
                 }
             )
         }
@@ -90,12 +79,17 @@ fun ReservationReviewScreen(
         ) {
             ReservedItemsCard(
                 items = items,
-                onRemove = { item -> items.remove(item) }
+                cartLines = cart,
+                onRemove = { medicineId -> CartStore.remove(medicineId) }
             )
 
             Spacer(Modifier.height(14.dp))
 
-            SlipVerificationCard(attached = prescriptionAttached)
+            SlipVerificationCard(
+                attached = CartStore.slipStoragePath != null,
+                fileName = CartStore.slipFileName,
+                onAddSlip = onAddSlip
+            )
 
             Spacer(Modifier.height(14.dp))
 
@@ -152,8 +146,9 @@ private fun ReviewTopBar(onBack: () -> Unit) {
 
 @Composable
 private fun ReservedItemsCard(
-    items: List<ReservedItem>,
-    onRemove: (ReservedItem) -> Unit
+    items: List<Pair<String, String>>,
+    cartLines: List<CartLine>,
+    onRemove: (String) -> Unit
 ) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
@@ -187,8 +182,14 @@ private fun ReservedItemsCard(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
                 )
             } else {
-                items.forEachIndexed { index, item ->
-                    ReservedItemRow(item = item, onRemove = { onRemove(item) })
+                items.forEachIndexed { index, (title, detail) ->
+                    val line = cartLines.getOrNull(index)
+                    ReservedItemRow(
+                        title = title,
+                        detail = detail,
+                        quantity = line?.quantity,
+                        onRemove = line?.let { { onRemove(it.medicineId) } }
+                    )
                     if (index != items.lastIndex) {
                         HorizontalDivider(color = BorderColor, thickness = 1.dp)
                     }
@@ -215,7 +216,12 @@ private fun CountChip(count: Int) {
 }
 
 @Composable
-private fun ReservedItemRow(item: ReservedItem, onRemove: () -> Unit) {
+private fun ReservedItemRow(
+    title: String,
+    detail: String,
+    quantity: Int?,
+    onRemove: (() -> Unit)?
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -225,41 +231,45 @@ private fun ReservedItemRow(item: ReservedItem, onRemove: () -> Unit) {
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = item.name,
+                text = title,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = DarkSlate
             )
-            if (item.detail.isNotBlank()) {
+            if (detail.isNotBlank()) {
                 Text(
-                    text = item.detail,
+                    text = detail,
                     fontSize = 12.5.sp,
                     color = SlateMedium
                 )
             }
         }
-        Text(
-            text = "Qty: ${item.quantity}",
-            fontSize = 14.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = ForestEmerald
-        )
-        IconButton(
-            onClick = onRemove,
-            modifier = Modifier
-                .padding(start = 6.dp)
-                .semantics { contentDescription = "Remove ${item.name}" }
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Close,
-                contentDescription = null,
-                tint = SlateMedium,
-                modifier = Modifier
-                    .size(26.dp)
-                    .clip(CircleShape)
-                    .background(ErrorRed.copy(alpha = 0.10f))
-                    .padding(4.dp)
+        if (quantity != null) {
+            Text(
+                text = "Qty: $quantity",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = ForestEmerald
             )
+        }
+        if (onRemove != null) {
+            IconButton(
+                onClick = onRemove,
+                modifier = Modifier
+                    .padding(start = 6.dp)
+                    .semantics { contentDescription = "Remove $title" }
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Close,
+                    contentDescription = null,
+                    tint = SlateMedium,
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(ErrorRed.copy(alpha = 0.10f))
+                        .padding(4.dp)
+                )
+            }
         }
     }
 }
@@ -269,7 +279,11 @@ private fun ReservedItemRow(item: ReservedItem, onRemove: () -> Unit) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun SlipVerificationCard(attached: Boolean) {
+private fun SlipVerificationCard(
+    attached: Boolean,
+    fileName: String?,
+    onAddSlip: () -> Unit
+) {
     val shape = RoundedCornerShape(16.dp)
     Surface(
         modifier = Modifier
@@ -279,60 +293,82 @@ private fun SlipVerificationCard(attached: Boolean) {
         color = SurfaceWhite,
         border = BorderStroke(1.dp, if (attached) MintGreen.copy(alpha = 0.45f) else BorderColor)
     ) {
-        Row(
-            modifier = Modifier.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (attached) {
-                PrescriptionThumbnail(modifier = Modifier.size(width = 56.dp, height = 68.dp))
-                Spacer(Modifier.width(14.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Attached Slip: $SLIP_FILE_NAME",
-                        fontSize = 14.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = DarkSlate
-                    )
-                    Text(
-                        text = "Encrypted with AES-256",
-                        fontSize = 12.5.sp,
-                        color = SlateMedium
-                    )
-                }
-                Icon(
-                    imageVector = Icons.Rounded.CheckCircle,
-                    contentDescription = "Prescription verified",
-                    tint = SuccessGreen,
-                    modifier = Modifier.size(26.dp)
-                )
-            } else {
-                Box(
-                    modifier = Modifier
-                        .size(56.dp)
-                        .clip(shape)
-                        .background(LightBackground)
-                        .border(1.dp, BorderColor, shape),
-                    contentAlignment = Alignment.Center
-                ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (attached) {
+                    PrescriptionThumbnail(modifier = Modifier.size(width = 56.dp, height = 68.dp))
+                    Spacer(Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (fileName.isNullOrBlank()) "Prescription slip attached"
+                            else "Attached slip: $fileName",
+                            fontSize = 14.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = DarkSlate
+                        )
+                        Text(
+                            text = "Only the pharmacist you reserve with can open it",
+                            fontSize = 12.5.sp,
+                            color = SlateMedium,
+                            lineHeight = 17.sp
+                        )
+                    }
                     Icon(
-                        imageVector = Icons.Rounded.Info,
-                        contentDescription = null,
-                        tint = SlateLight,
-                        modifier = Modifier.size(22.dp)
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = "Prescription verified",
+                        tint = SuccessGreen,
+                        modifier = Modifier.size(26.dp)
                     )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(shape)
+                            .background(LightBackground)
+                            .border(1.dp, BorderColor, shape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PhotoCamera,
+                            contentDescription = null,
+                            tint = SlateMedium,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "No slip attached",
+                            fontSize = 14.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = DarkSlate
+                        )
+                        Text(
+                            text = "The pharmacist may ask for the prescription at pickup",
+                            fontSize = 12.5.sp,
+                            color = SlateMedium,
+                            lineHeight = 17.sp
+                        )
+                    }
                 }
-                Spacer(Modifier.width(14.dp))
-                Column(modifier = Modifier.weight(1f)) {
+            }
+
+            if (!attached) {
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = onAddSlip,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .semantics { contentDescription = "Add prescription slip" },
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.5.dp, ForestEmerald),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = ForestEmerald)
+                ) {
                     Text(
-                        text = "No slip attached",
+                        text = "Add Prescription Slip",
                         fontSize = 14.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = DarkSlate
-                    )
-                    Text(
-                        text = "The pharmacist may ask for the prescription at pickup",
-                        fontSize = 12.5.sp,
-                        color = SlateMedium
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }

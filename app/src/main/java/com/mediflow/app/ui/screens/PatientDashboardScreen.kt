@@ -26,9 +26,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mediflow.app.data.AppGraph
 import com.mediflow.app.ui.theme.*
 import java.util.Calendar
-import kotlinx.coroutines.launch
 
 /**
  * Screen 4 — Patient Dashboard (Variant B)
@@ -40,36 +40,28 @@ import kotlinx.coroutines.launch
  *  • Pharmacies    — "Recently Registered Pharmacies" list with stock badges
  *  • Bottom Bar    — Home / Search / Vault / Alerts / Profile, persistent
  *
- * Sample data below is UI-phase scaffolding; it is replaced by the repository
- * layer once the backend exists.
+ * Data is read from Firestore on entry via [AppGraph]: the greeting name comes
+ * from the signed-in profile, the reservation card and bell badge from the
+ * patient's reservations and notifications, and the pharmacy list from the
+ * admin-approved pharmacies.
  *
  * Nielsen Heuristics: #4 (Consistency), #6 (Recognition over recall), #8 (Aesthetic)
  * WCAG 2.1 AA: 48dp+ touch targets, semantic labels on every control
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UI-phase sample data
+// UI models projected from the repositories
 // ─────────────────────────────────────────────────────────────────────────────
 
-private const val PATIENT_NAME = "Kavindu Perera"
-private const val NOTIFICATION_COUNT = 3
+// No backend source for distance; kept static as approved decoration.
+private const val REGISTERED_PHARMACY_DISTANCE_KM = 1.2
 
 private data class ActiveReservation(val pharmacyName: String, val reference: String)
 
 private data class RegisteredPharmacy(
     val name: String,
     val area: String,
-    val distanceKm: Double,
-    val inStock: Boolean
-)
-
-private val sampleReservation: ActiveReservation? = ActiveReservation("Serendib Pharmacy", "4521")
-
-private val sampleRegisteredPharmacies = listOf(
-    RegisteredPharmacy("Serendib Pharmacy", "Kurunegala", 1.2, inStock = true),
-    RegisteredPharmacy("MedLife Pharmacy", "Ibbagamuwa", 2.8, inStock = false),
-    RegisteredPharmacy("Health Plus", "Mawathagama", 4.5, inStock = true),
-    RegisteredPharmacy("Crown Chemists", "Nikitasthena", 6.1, inStock = false)
+    val distanceKm: Double
 )
 
 private enum class DashboardTab(val label: String, val icon: ImageVector) {
@@ -88,12 +80,33 @@ private enum class DashboardTab(val label: String, val icon: ImageVector) {
 fun PatientDashboardScreen(
     onLogout: () -> Unit,
     onUploadSlip: () -> Unit,
-    onDirectSearch: () -> Unit,
+    onSearchProceed: (label: String, variant: String) -> Unit,
     onShowCounterQr: (reference: String, medicineLabel: String, pharmacyName: String) -> Unit
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(DashboardTab.HOME) }
+    var showNotifications by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
+
+    val profile = AppGraph.currentProfile
+    var patientName by remember { mutableStateOf(profile?.name.orEmpty()) }
+    var notificationCount by remember { mutableStateOf(0) }
+    var activeReservation by remember { mutableStateOf<ActiveReservation?>(null) }
+    var registeredPharmacies by remember { mutableStateOf<List<RegisteredPharmacy>>(emptyList()) }
+
+    val uid = profile?.uid
+    LaunchedEffect(uid) {
+        patientName = profile?.name.orEmpty()
+        if (uid != null) {
+            val reservations =
+                runCatching { AppGraph.reservations.forPatient(uid) }.getOrNull().orEmpty()
+            activeReservation = reservations.firstOrNull { it.isActive }
+                ?.let { ActiveReservation(it.pharmacyName, it.reference) }
+            val inbox = runCatching { AppGraph.notifications.forPatient(uid) }.getOrNull().orEmpty()
+            notificationCount = inbox.count { !it.isRead }
+        }
+        registeredPharmacies = runCatching { AppGraph.pharmacies.approved() }.getOrNull().orEmpty()
+            .map { RegisteredPharmacy(it.name, it.areaLabel, REGISTERED_PHARMACY_DISTANCE_KM) }
+    }
 
     Scaffold(
         containerColor = LightBackground,
@@ -105,36 +118,81 @@ fun PatientDashboardScreen(
             )
         }
     ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
-        ) {
+        // ── Notifications overlay (bell or Alerts tab) ────────────────────
+        if (showNotifications) {
+            PatientNotificationsScreen(onBack = {
+                showNotifications = false
+                // If we arrived from the Alerts tab, go back to Home
+                if (selectedTab == DashboardTab.ALERTS) selectedTab = DashboardTab.HOME
+            })
+        } else {
             when (selectedTab) {
-                DashboardTab.HOME -> HomeTabContent(
-                    onNotificationsClick = {
-                        scope.launch { snackbarHostState.showSnackbar("Notifications arrive next") }
-                    },
-                    onUploadSlip = onUploadSlip,
-                    onDirectSearch = onDirectSearch,
-                    onViewDetails = {
-                        scope.launch { snackbarHostState.showSnackbar("Reservation details are pending") }
-                    },
-                    onPharmacyClick = { pharmacy ->
-                        scope.launch { snackbarHostState.showSnackbar("${pharmacy.name} catalog is pending") }
+                // ── Search tab ─────────────────────────────────────────────
+                DashboardTab.SEARCH -> {
+                    // The nested Scaffold in SmartSearchScreen draws its own footer,
+                    // so it has to sit above the dashboard bar rather than under it.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                    ) {
+                        SmartSearchScreen(
+                            onBack = { selectedTab = DashboardTab.HOME },
+                            onChangePhoto = onUploadSlip,
+                            onProceed = onSearchProceed
+                        )
                     }
-                )
+                }
 
-                DashboardTab.VAULT -> ReservationVaultTabContent(
-                    onShowQr = onShowCounterQr,
-                    onStartSearch = onDirectSearch
-                )
+                // ── Alerts tab → notifications screen ──────────────────────
+                DashboardTab.ALERTS -> {
+                    PatientNotificationsScreen(onBack = { selectedTab = DashboardTab.HOME })
+                }
 
-                else -> PendingTabContent(
-                    tab = selectedTab,
-                    onLogout = onLogout.takeIf { selectedTab == DashboardTab.PROFILE }
-                )
+                // ── Profile tab → rich profile screen ──────────────────────
+                DashboardTab.PROFILE -> {
+                    PatientProfileScreen(
+                        onLogout = onLogout,
+                        onBack = { selectedTab = DashboardTab.HOME },
+                        onNavigateToVault = { selectedTab = DashboardTab.VAULT },
+                        onNavigateToSearch = { selectedTab = DashboardTab.SEARCH }
+                    )
+                }
+
+                // ── All other tabs: scrollable column ──────────────────────
+                else -> {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        when (selectedTab) {
+                            DashboardTab.HOME -> HomeTabContent(
+                                name = patientName,
+                                notificationCount = notificationCount,
+                                activeReservation = activeReservation,
+                                pharmacies = registeredPharmacies,
+                                onNotificationsClick = { showNotifications = true },
+                                onProfileClick = { selectedTab = DashboardTab.PROFILE },
+                                onUploadSlip = onUploadSlip,
+                                onDirectSearch = { selectedTab = DashboardTab.SEARCH },
+                                onViewDetails = { selectedTab = DashboardTab.VAULT },
+                                onPharmacyClick = { selectedTab = DashboardTab.SEARCH }
+                            )
+
+                            DashboardTab.VAULT -> ReservationVaultTabContent(
+                                onShowQr = onShowCounterQr,
+                                onStartSearch = { selectedTab = DashboardTab.SEARCH }
+                            )
+
+                            else -> PendingTabContent(
+                                tab = selectedTab,
+                                onLogout = onLogout.takeIf { selectedTab == DashboardTab.PROFILE }
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -146,19 +204,25 @@ fun PatientDashboardScreen(
 
 @Composable
 private fun HomeTabContent(
+    name: String,
+    notificationCount: Int,
+    activeReservation: ActiveReservation?,
+    pharmacies: List<RegisteredPharmacy>,
     onNotificationsClick: () -> Unit,
+    onProfileClick: () -> Unit = {},
     onUploadSlip: () -> Unit,
     onDirectSearch: () -> Unit,
     onViewDetails: () -> Unit,
     onPharmacyClick: (RegisteredPharmacy) -> Unit
 ) {
     DashboardTopBar(
-        name = PATIENT_NAME,
-        notificationCount = NOTIFICATION_COUNT,
-        onNotificationsClick = onNotificationsClick
+        name = name,
+        notificationCount = notificationCount,
+        onNotificationsClick = onNotificationsClick,
+        onProfileClick = onProfileClick
     )
 
-    sampleReservation?.let { reservation ->
+    activeReservation?.let { reservation ->
         ActiveReservationCard(
             reservation = reservation,
             onViewDetails = onViewDetails,
@@ -181,7 +245,7 @@ private fun HomeTabContent(
             .padding(bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        sampleRegisteredPharmacies.forEach { pharmacy ->
+        pharmacies.forEach { pharmacy ->
             PharmacyListItem(
                 pharmacy = pharmacy,
                 onClick = { onPharmacyClick(pharmacy) }
@@ -198,7 +262,8 @@ private fun HomeTabContent(
 private fun DashboardTopBar(
     name: String,
     notificationCount: Int,
-    onNotificationsClick: () -> Unit
+    onNotificationsClick: () -> Unit,
+    onProfileClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -209,9 +274,12 @@ private fun DashboardTopBar(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(12.dp))
+                .clickable { onProfileClick() }
         ) {
-            PatientAvatar(name = name)
+            PatientAvatar(name = name, onClick = onProfileClick)
             Spacer(modifier = Modifier.width(12.dp))
             Column {
                 Text(
@@ -240,12 +308,13 @@ private fun DashboardTopBar(
 }
 
 @Composable
-private fun PatientAvatar(name: String) {
+private fun PatientAvatar(name: String, onClick: () -> Unit = {}) {
     Box(
         modifier = Modifier
             .size(48.dp)
             .clip(CircleShape)
-            .background(Brush.linearGradient(listOf(GradientStart, GradientEnd))),
+            .background(Brush.linearGradient(listOf(GradientStart, GradientEnd)))
+            .clickable { onClick() },
         contentAlignment = Alignment.Center
     ) {
         Text(
@@ -309,6 +378,7 @@ private fun ActiveReservationCard(
     onViewDetails: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val displayReference = reservation.reference.takeLast(4)
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -317,7 +387,7 @@ private fun ActiveReservationCard(
             .padding(start = 20.dp, end = 8.dp, top = 18.dp, bottom = 14.dp)
             .semantics {
                 contentDescription =
-                    "Active reservation at ${reservation.pharmacyName}, reference ${reservation.reference}"
+                    "Active reservation at ${reservation.pharmacyName}, reference $displayReference"
             },
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -351,7 +421,7 @@ private fun ActiveReservationCard(
                 )
             )
             Text(
-                text = "REF# ${reservation.reference}",
+                text = "REF# $displayReference",
                 style = MaterialTheme.typography.bodySmall.copy(color = SlateLight),
                 modifier = Modifier.padding(top = 2.dp)
             )
@@ -482,8 +552,6 @@ private fun SectionTitle(text: String) {
 
 @Composable
 private fun PharmacyListItem(pharmacy: RegisteredPharmacy, onClick: () -> Unit) {
-    val stockLabel = if (pharmacy.inStock) "In Stock" else "Partial"
-
     Surface(
         onClick = onClick,
         modifier = Modifier
@@ -491,7 +559,7 @@ private fun PharmacyListItem(pharmacy: RegisteredPharmacy, onClick: () -> Unit) 
             .heightIn(min = 68.dp)
             .semantics {
                 contentDescription =
-                    "${pharmacy.name}, ${pharmacy.distanceKm} kilometres away, $stockLabel"
+                    "${pharmacy.name}, ${pharmacy.distanceKm} kilometres away"
             },
         shape = RoundedCornerShape(16.dp),
         color = SurfaceWhite,
@@ -533,43 +601,11 @@ private fun PharmacyListItem(pharmacy: RegisteredPharmacy, onClick: () -> Unit) 
                 )
             }
 
-            Spacer(modifier = Modifier.width(8.dp))
-
-            StockBadge(inStock = pharmacy.inStock, label = stockLabel)
-
             Icon(
                 imageVector = Icons.Rounded.ChevronRight,
                 contentDescription = null,
                 tint = SlateLight,
                 modifier = Modifier.padding(start = 6.dp).size(20.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun StockBadge(inStock: Boolean, label: String) {
-    Surface(
-        shape = RoundedCornerShape(20.dp),
-        color = if (inStock) Color(0xFFECFDF5) else Color(0xFFFFFBEB)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Icon(
-                imageVector = if (inStock) Icons.Rounded.CheckCircle else Icons.Rounded.Warning,
-                contentDescription = null,
-                tint = if (inStock) ForestEmerald else AmberWarning,
-                modifier = Modifier.size(12.dp)
-            )
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall.copy(
-                    color = if (inStock) ForestEmerald else AmberWarning,
-                    fontWeight = FontWeight.SemiBold
-                )
             )
         }
     }

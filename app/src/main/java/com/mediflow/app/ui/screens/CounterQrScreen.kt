@@ -20,8 +20,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
-import com.mediflow.app.ui.components.QrCodeArt
+import com.mediflow.app.data.AppGraph
+import com.mediflow.app.data.model.Reservation
+import com.mediflow.app.ui.components.QrCode
 import com.mediflow.app.ui.theme.*
+import java.text.DateFormat
+import java.util.Date
+
+private fun formatPickup(expiresAtMillis: Long): String =
+    "Collect by " + DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+        .format(Date(expiresAtMillis))
 
 /**
  * Counter code — the screen a patient turns to face the pharmacist.
@@ -39,7 +47,19 @@ import com.mediflow.app.ui.theme.*
 fun CounterQrScreen(reference: String, medicineLabel: String, pharmacyName: String, onBack: () -> Unit) {
     MaxBrightnessWhileVisible()
 
-    val shownReference = reference.ifBlank { "4821" }
+    // The route only carries the reference; the row itself is read so the counter
+    // sees the live status rather than whatever was on screen when the patient tapped.
+    var reservation by remember(reference) { mutableStateOf<Reservation?>(null) }
+    LaunchedEffect(reference) {
+        reservation = runCatching { AppGraph.reservations.byReference(reference) }.getOrNull()
+    }
+
+    val shownReference = reference.ifBlank { reservation?.reference.orEmpty() }.ifBlank { "Not available" }
+    val shownMedicines = reservation?.medicineLabels
+        ?.takeIf { it.isNotEmpty() }
+        ?.joinToString()
+        ?: medicineLabel
+    val shownPharmacy = reservation?.pharmacyName?.takeIf { it.isNotBlank() } ?: pharmacyName
 
     Scaffold(
         containerColor = DarkBackground,
@@ -93,7 +113,7 @@ fun CounterQrScreen(reference: String, medicineLabel: String, pharmacyName: Stri
                 shape = RoundedCornerShape(18.dp),
                 color = Color.White
             ) {
-                QrCodeArt(reference = shownReference, modifier = Modifier.fillMaxSize().padding(14.dp))
+                QrCode(value = shownReference, modifier = Modifier.fillMaxSize().padding(14.dp))
             }
 
             Spacer(Modifier.height(22.dp))
@@ -106,11 +126,15 @@ fun CounterQrScreen(reference: String, medicineLabel: String, pharmacyName: Stri
             )
             Spacer(Modifier.height(18.dp))
 
-            DetailLine("Medicine", medicineLabel.ifBlank { "Paracetamol 500mg" })
+            DetailLine("Medicine", shownMedicines.ifBlank { "Loading…" })
             Spacer(Modifier.height(10.dp))
-            DetailLine("Pharmacy", pharmacyName.ifBlank { "City Pharmacy Negombo" })
+            DetailLine("Pharmacy", shownPharmacy.ifBlank { "Loading…" })
             Spacer(Modifier.height(10.dp))
-            DetailLine("Pickup", "Today before 6:00 PM")
+            DetailLine(
+                "Pickup",
+                reservation?.let { "Reference ${it.reference} · ${formatPickup(it.expiresAtMillis)}" }
+                    ?: "Loading…"
+            )
 
             Spacer(Modifier.height(28.dp))
             Text(
